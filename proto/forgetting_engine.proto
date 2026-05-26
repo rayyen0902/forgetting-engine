@@ -1,0 +1,144 @@
+syntax = "proto3";
+
+package forgetting_engine;
+
+// ── 遗忘引擎 gRPC 服务 ──────────────────────────────────
+//
+// 调用方（如 HuFu Go 服务）通过此接口与引擎交互。
+// 插件（SkincareAdapter）在引擎启动时注册，调用方无感知。
+
+service ForgettingEngine {
+    // ── Agent 管理 ──
+    rpc CreateAgent(CreateAgentRequest) returns (CreateAgentResponse);
+    rpc DeleteAgent(DeleteAgentRequest) returns (DeleteAgentResponse);
+    rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+
+    // ── 记忆写入 ──
+    rpc Ingest(IngestRequest) returns (IngestResponse);
+
+    // ── 检索 + 注入（最常用，一次调用完成）──
+    rpc RetrieveAndRender(RetrieveAndRenderRequest) returns (RetrieveAndRenderResponse);
+
+    // ── 遗忘维护 ──
+    rpc DecayCycle(DecayCycleRequest) returns (DecayCycleResponse);
+
+    // ── 计费查询 ──
+    rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
+}
+
+
+// ── 所有 RPC 的通用约定 ──────────────────────────────────────
+//
+// gRPC metadata 中必须携带：
+//   x-api-key: <tenant_api_key>
+//
+// 计费拦截器在 Ingest / RetrieveAndRender 入口处校验配额并扣次数。
+// CreateAgent 不计费但检查 agent 数量上限。
+// 配额不足时返回 gRPC status code RESOURCE_EXHAUSTED。
+
+
+// ── Agent 管理 ─────────────────────────────────────────
+
+message CreateAgentRequest {
+    string agent_id = 1;    // 唯一标识，如 "hf_user_123"
+    string domain = 2;       // "default" | "skincare" | ...
+}
+
+message CreateAgentResponse {
+    string agent_id = 1;
+}
+
+message DeleteAgentRequest {
+    string agent_id = 1;
+}
+
+message DeleteAgentResponse {}
+
+message ListAgentsRequest {}
+
+message AgentInfo {
+    string agent_id = 1;
+    string domain = 2;
+    int32 trace_count = 3;
+    bool is_active = 4;
+    string clock = 5;         // "e0.v0.c0.s0.m5"
+}
+
+message ListAgentsResponse {
+    repeated AgentInfo agents = 1;
+}
+
+
+// ── 记忆写入 ──────────────────────────────────────────
+
+message RawMessage {
+    string role = 1;          // "user" | "agent" | "system"
+    string text = 2;
+    string session_id = 3;
+    int64 created_at = 4;     // Client-side unix timestamp (ms)
+}
+
+message IngestRequest {
+    string agent_id = 1;
+    RawMessage message = 2;
+    double significance = 3;  // 0.0~1.0，默认 0（普通消息），>0 触发回溯增强
+}
+
+message IngestResponse {
+    string trace_id = 1;
+    int32 trace_count = 2;    // 当前 agent 的 trace 总数
+}
+
+
+// ── 检索 + 注入（合并 retrieve + render_for_injection）──
+
+message Cue {
+    string type = 1;          // "entity" | "topic" | "action" | "emotion"
+    string value = 2;
+    double weight = 3;        // 0.0 ~ 1.0
+}
+
+message RetrieveAndRenderRequest {
+    string agent_id = 1;
+    string current_session_id = 2;
+    repeated string recent_messages = 3;
+    repeated Cue cues = 4;
+    map<string, string> domain_hints = 5;
+}
+
+message RetrieveAndRenderResponse {
+    string injection_text = 1;  // 可直接拼入 LLM prompt 的文本
+    int32 traces_retrieved = 2; // 本轮检索到的 trace 数量
+}
+
+
+// ── 遗忘维护 ──────────────────────────────────────────
+
+message DecayCycleRequest {
+    string agent_id = 1;      // 空字符串 = 遍历所有 agent
+}
+
+message DecayReport {
+    int32 retained = 1;
+    int32 deleted = 2;
+    map<int32, int32> descended = 3;  // layer -> count
+}
+
+message DecayCycleResponse {
+    map<string, DecayReport> reports = 1;  // agent_id -> report
+}
+
+
+// ── 计费 ──────────────────────────────────────────────
+
+message GetUsageRequest {}
+
+message GetUsageResponse {
+    string tenant_name = 1;
+    int64 agent_count = 2;          // 当前 agent 数
+    int64 agent_limit = 3;          // agent 上限
+    int64 calls_used = 4;           // 当月已用调用次数
+    int64 calls_limit = 5;          // 当月调用上限
+    string current_period = 6;      // 计费周期，如 "2026-05"
+    string tier = 7;                // "free" | "pro" | "enterprise"
+}
