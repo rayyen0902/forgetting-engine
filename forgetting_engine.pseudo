@@ -1,0 +1,1322 @@
+# ============================================================
+# 遗忘引擎（Forgetting Engine）— 通用伪代码
+# ============================================================
+# 原则：
+#   1. 忘是默认，记住是例外
+#   2. 遗忘是主循环，保留是副作用
+#   3. 引擎通用，领域差异通过 DomainAdapter 注入
+#   4. 时间尺度 = 交互密度（m），不是真实时间
+#
+# 时间体系（8 进制）：
+#   瞬 m (moment)   =  1m            1轮交互
+#   幕 s (scene)    =  8m            一个话题段落
+#   章 c (chapter)  =  64m  (8s)     一次完整会话
+#   卷 v (volume)   =  512m (8c)     一个使用周期
+#   纪 e (era)      = 4096m (8v)     一个关系时代
+#
+#   标记格式：  e0.v1.c2.s3.m4
+#   内部计算统一折合为 m
+# ============================================================
+
+# ── 基础类型 ──────────────────────────────────────────────
+
+enum Layer:
+    L0 = 0    # 原始消息，全量保留
+    L1 = 1    # 叙事片段
+    L2 = 2    # 行为模式
+    L3 = 3    # 结构化事实
+    L4 = 4    # 已删除（逻辑删除）
+
+
+# ── 时间坐标 ──────────────────────────────────────────────
+
+@dataclass
+class TimePosition:
+    """
+    Agent 时间坐标。8进制递进，模拟叙事节奏。
+
+    内部计算统一用 m（瞬），外部展示用层级标记。
+    """
+    e: int = 0   # 纪 era      4096m
+    v: int = 0   # 卷 volume    512m
+    c: int = 0   # 章 chapter    64m
+    s: int = 0   # 幕 scene        8m
+    m: int = 0   # 瞬 moment       1m
+
+    # ── 进位常量 ──
+    M_PER_S = 8
+    M_PER_C = 64     # 8 * 8
+    M_PER_V = 512    # 8 * 8 * 8
+    M_PER_E = 4096   # 8 * 8 * 8 * 8
+
+    def to_m(self) -> int:
+        return (self.e * self.M_PER_E
+              + self.v * self.M_PER_V
+              + self.c * self.M_PER_C
+              + self.s * self.M_PER_S
+              + self.m)
+
+    @classmethod
+    def from_m(cls, total: int) -> "TimePosition":
+        e = total // cls.M_PER_E
+        rest = total % cls.M_PER_E
+        v = rest // cls.M_PER_V
+        rest %= cls.M_PER_V
+        c = rest // cls.M_PER_C
+        rest %= cls.M_PER_C
+        s = rest // cls.M_PER_S
+        m = rest % cls.M_PER_S
+        return cls(e=e, v=v, c=c, s=s, m=m)
+
+    def distance_m(self, other: "TimePosition") -> int:
+        """以 m 为单位的时间距离"""
+        return self.to_m() - other.to_m()
+
+    def add_m(self, delta: int) -> "TimePosition":
+        return TimePosition.from_m(self.to_m() + delta)
+
+    def __str__(self) -> str:
+        return f"e{self.e}.v{self.v}.c{self.c}.s{self.s}.m{self.m}"
+
+    def __repr__(self) -> str:
+        return str(self)
+
+
+# ── 核心数据结构 ──────────────────────────────────────────
+
+@dataclass
+class DecayCurve:
+    """
+    遗忘曲线。时间单位 = m（瞬）。
+
+    retention = initial * e^(-lambda * m_idle)
+    """
+    initial: float                # 初始值，默认 1.0
+    lambda_: float                # 衰减系数（每 m），由 connectivity 决定
+    last_access: TimePosition     # 最后一次被检索到的时间
+    access_count: int
+
+    def evaluate(self, now: TimePosition) -> float:
+        m_idle = now.distance_m(self.last_access)
+        return self.initial * exp(-self.lambda_ * m_idle)
+
+
+@dataclass
+class MemoryTrace:
+    """
+    遗忘引擎中的最小存储单元。
+    进入系统即绑定 decay_curve，开始遗忘倒计时。
+    """
+    id: str
+    layer: Layer
+    content: Any                          # 各层格式不同
+    born_at: TimePosition
+    wall_clock_born: datetime             # 仅用于展示/调试
+
+    decay_curve: DecayCurve
+
+    connectivity_score: int               # 与现有记忆网的连接数
+    significance: float                   # 0.0 ~ 1.0
+    retained_by: list[str]                # 当前被哪些 RetainCondition 拦截
+
+    immunity_until: TimePosition | None   # 免疫期截止时间
+
+    parent_trace_ids: list[str]
+    child_trace_ids: list[str]
+
+    is_first_of_session: bool
+
+    deleted_at: TimePosition | None
+
+    def m_since_born(self, now: TimePosition) -> int:
+        return now.distance_m(self.born_at)
+
+    def retention(self, now: TimePosition) -> float:
+        return self.decay_curve.evaluate(now)
+
+    def is_deleted(self) -> bool:
+        return self.deleted_at is not None
+
+
+# ── 各层内容格式 ──────────────────────────────────────────
+
+@dataclass
+class L0_RawMessage:
+    role: str                # "user" | "agent" | "system"
+    text: str
+    time: TimePosition
+    wall_clock: datetime     # 仅用于展示
+    session_id: str
+
+
+@dataclass
+class L1_Episode:
+    participants: list[str]
+    topic: str
+    action_type: str
+    subject_entity: str
+    predicate: str
+    outcome: str
+    negation: str | None
+    emotional_tone: float                   # -1.0 ~ 1.0
+    time: TimePosition
+    wall_clock: datetime                    # 仅用于展示
+    embedding: list[float]
+
+
+@dataclass
+class L2_Pattern:
+    type: str                # "frequency" | "contrast" | "cascade"
+    description: str
+    confidence: float        # 0.0 ~ 1.0
+    source_episode_ids: list[str]
+    evidence_count: int
+    last_observed_at: TimePosition
+
+
+@dataclass
+class L3_Fact:
+    key: str
+    value: Any
+    fact_type: str           # "identity" | "preference" | "constraint" | "transient"
+    sentence: str            # 压缩时 LLM 生成的自然语言描述，注入时直接拼接
+    confidence: float
+    source_pattern_ids: list[str]
+    last_updated_at: TimePosition
+
+
+# ── RetainCondition ───────────────────────────────────────
+
+@dataclass
+class RetainCondition:
+    """
+    命中后 retention 重置为 1.0，immunity_m 内不被再次评估。
+    """
+    name: str
+    priority: int
+    evaluate: Callable[[MemoryTrace, "EngineContext"], bool]
+    immunity_m: int            # 免疫持续的 m 数
+
+
+# ── 操作日志 ──────────────────────────────────────────────
+
+@dataclass
+class EngineLog:
+    """
+    单条操作日志。
+    覆盖所有数据窗口：ingest → decay → descend → compress → retrieve → inject → gc。
+    日志按 tick 顺序累积，可从引擎检索用于行为校验。
+    """
+    id: str                         # 日志条目 ID
+    time: TimePosition              # 操作发生时的引擎时间
+    wall_clock: datetime            # 真实时间（辅助）
+    operation: str                  # "ingest" | "decay" | "descend" | "compress" | "retrieve" | "inject" | "gc" | "retain"
+    trace_ids: list[str]            # 涉及的 trace ID
+    detail: str                     # 人类可读描述
+    metrics: dict                   # 量化指标 (retention, connectivity, confidence...)
+    decision: str                   # 决策结果 (retained | descended | deleted | injected | stitched | conflict_found...)
+
+
+class EngineLogger:
+    """
+    日志写入器。环形缓冲区，保留最近 N 条。
+    外部可随时调用 engine.logger.recent(n) 查看操作历史。
+    """
+
+    def __init__(self, capacity: int = 10000):
+        self.buffer: list[EngineLog] = []
+        self.capacity = capacity
+
+    def append(self, entry: EngineLog) -> None:
+        self.buffer.append(entry)
+        if len(self.buffer) > self.capacity:
+            self.buffer = self.buffer[-self.capacity:]
+
+    def recent(self, n: int = 50) -> list[EngineLog]:
+        return self.buffer[-n:]
+
+    def by_trace(self, trace_id: str) -> list[EngineLog]:
+        """按 trace ID 回溯该 trace 的完整生命周期"""
+        return [e for e in self.buffer if trace_id in e.trace_ids]
+
+    def by_operation(self, op: str, n: int = 20) -> list[EngineLog]:
+        return [e for e in self.buffer if e.operation == op][-n:]
+
+
+# ── DomainAdapter 接口 ────────────────────────────────────
+
+class DomainAdapter(ABC):
+
+    @abstractmethod
+    def action_types(self) -> list[str]: ...
+
+    @abstractmethod
+    def similarity(self, a, b) -> float: ...
+
+    @abstractmethod
+    def fact_schema(self) -> dict[str, "FactField"]: ...
+
+    @abstractmethod
+    def danger_signals(self) -> list[str]: ...
+
+    @abstractmethod
+    def extra_retain_conditions(self) -> list[RetainCondition]: ...
+
+    @abstractmethod
+    def relevance(self, trace: MemoryTrace, context: "RetrievalContext") -> float: ...
+
+    @abstractmethod
+    def activation_threshold(self, layer: Layer) -> float: ...
+
+    def is_danger_signal(self, text: str) -> bool:
+        return any(s in text for s in self.danger_signals())
+
+
+# ── Agent 运行时 ──────────────────────────────────────────
+
+@dataclass
+class AgentRuntime:
+    """
+    每个 agent 的独立运行时状态。
+    引擎通过 agent_id 路由到对应运行时。
+    """
+    agent_id: str
+    domain_name: str                          # "skincare" | "coding" | "default"
+    domain: DomainAdapter
+    clock: TimePosition                       # 独立 M-Clock
+    traces: dict[str, MemoryTrace]            # 该 agent 的全部 traces
+    retain_conditions: list[RetainCondition]  # 内置 + 领域追加
+    wall_clock_start: datetime                # 仅用于弃用检测
+    created_at: datetime
+    is_active: bool
+
+
+# ── 引擎主体 ──────────────────────────────────────────────
+
+class ForgettingEngine:
+    """
+    通用遗忘引擎 — 多 agent 共享实例。
+
+    agent_id 是最高隔离键：
+      - 每个 agent 独立 M-Clock
+      - 每个 agent 独立 traces + retain_conditions
+      - 每个 agent 绑定一个 domain（创建时确定，不可变）
+
+    gRPC 入口：
+      ingest(agent_id, message)
+      retrieve(agent_id, context)
+      render_for_injection(agent_id, traces, context)
+    """
+
+    # ── 领域注册表 ──────────────────────────────────────
+
+    _domain_registry: dict[str, type[DomainAdapter]] = {
+        "default": DefaultAdapter,
+    }
+
+    @classmethod
+    def register_domain(cls, name: str, adapter_cls: type[DomainAdapter]) -> None:
+        """注册领域适配器类（引擎启动时一次性注册）"""
+        cls._domain_registry[name] = adapter_cls
+
+    # ── 引擎生命周期 ────────────────────────────────────
+
+    def __init__(self):
+        self.agents: dict[str, AgentRuntime] = {}
+        self.logger = EngineLogger()
+
+    def create_agent(self, agent_id: str, domain_name: str = "default") -> str:
+        """
+        创建 agent。返回 agent_id。
+
+        一个 agent = 一个独立记忆空间（独立 M-Clock + traces + domain）。
+        切换领域 = 创建新 agent。
+        """
+        if agent_id in self.agents:
+            raise ValueError(f"Agent '{agent_id}' already exists")
+
+        adapter_cls = self._domain_registry.get(domain_name)
+        if adapter_cls is None:
+            raise ValueError(f"Unknown domain: '{domain_name}'")
+
+        domain = adapter_cls()
+        runtime = AgentRuntime(
+            agent_id=agent_id,
+            domain_name=domain_name,
+            domain=domain,
+            clock=TimePosition(),
+            traces={},
+            retain_conditions=[],
+            wall_clock_start=now(),
+            created_at=now(),
+            is_active=True,
+        )
+        self._init_retain_conditions(runtime)
+        self.agents[agent_id] = runtime
+
+        self._log(agent_id, "agent", [agent_id],
+            f"Agent created: domain={domain_name}",
+            {"domain": domain_name},
+            "created",
+        )
+        return agent_id
+
+    def delete_agent(self, agent_id: str) -> None:
+        """软删除 agent（标记 inactive，GC 时清理 traces）"""
+        if agent_id not in self.agents:
+            return
+        self.agents[agent_id].is_active = False
+        self._log(agent_id, "agent", [agent_id],
+            "Agent deactivated", decision="deactivated")
+
+    def list_agents(self) -> list[dict]:
+        """列出所有 agent"""
+        return [
+            {"agent_id": r.agent_id, "domain": r.domain_name,
+             "clock": str(r.clock), "trace_count": len(r.traces),
+             "is_active": r.is_active}
+            for r in self.agents.values()
+        ]
+
+    # ── 内部路由 ────────────────────────────────────────
+
+    def _rt(self, agent_id: str) -> AgentRuntime:
+        """获取 agent 运行时（不存在则报错）"""
+        if agent_id not in self.agents:
+            raise ValueError(f"Agent '{agent_id}' not found. Call create_agent() first.")
+        rt = self.agents[agent_id]
+        if not rt.is_active:
+            raise ValueError(f"Agent '{agent_id}' is deactivated.")
+        return rt
+
+    def _log(self, agent_id: str, operation: str, trace_ids: list[str],
+             detail: str, metrics: dict | None = None, decision: str = "") -> None:
+        """写入操作日志，带 agent_id 标签"""
+        rt = self.agents.get(agent_id)
+        clock = rt.clock if rt else TimePosition()
+        self.logger.append(EngineLog(
+            id=generate_id(),
+            time=clock,
+            wall_clock=now(),
+            operation=operation,
+            trace_ids=trace_ids,
+            detail=f"[{agent_id}] {detail}",
+            metrics=metrics or {},
+            decision=decision,
+        ))
+
+    # ── 时钟 ────────────────────────────────────────────
+
+    def _tick(self, agent_id: str) -> TimePosition:
+        """推进指定 agent 的时钟 1m"""
+        rt = self._rt(agent_id)
+        rt.clock = rt.clock.add_m(1)
+        return rt.clock
+
+    # ── 入口 ────────────────────────────────────────────
+
+    def ingest(self, agent_id: str, message: L0_RawMessage) -> str:
+        """
+        数据进入引擎。推进 agent 的 M-Clock 1m。
+        """
+        rt = self._rt(agent_id)
+        current = self._tick(agent_id)
+
+        trace = MemoryTrace(
+            id=generate_id(),
+            layer=Layer.L0,
+            content=message,
+            born_at=current,
+            wall_clock_born=now(),
+            decay_curve=DecayCurve(
+                initial=1.0,
+                lambda_=self._base_lambda(),
+                last_access=current,
+                access_count=0,
+            ),
+            connectivity_score=0,
+            significance=0.0,
+            retained_by=[],
+            immunity_until=None,
+            parent_trace_ids=[],
+            child_trace_ids=[],
+            is_first_of_session=False,
+            deleted_at=None,
+        )
+
+        trace.connectivity_score = self._compute_connectivity(rt, trace)
+        trace.decay_curve.lambda_ = self._adjusted_lambda(trace.connectivity_score)
+
+        rt.traces[trace.id] = trace
+        self._log(agent_id, "ingest", [trace.id],
+            f"L0 ingested: session={message.session_id}",
+            {"connectivity": trace.connectivity_score, "lambda": trace.decay_curve.lambda_},
+        )
+        self._maybe_trigger_capacity_check(rt, Layer.L0)
+
+        return trace.id
+
+    def ingest_significant(
+        self, agent_id: str, message: L0_RawMessage, significance: float
+    ) -> str:
+        """
+        带显著性标记的入口。
+
+        回溯增强窗口：s1 + 2m（10m）。
+        窗口内的相关 trace 获得级联显著性。
+        """
+        rt = self._rt(agent_id)
+        BACKTRACE_WINDOW = TimePosition.M_PER_S + 2
+        current = rt.clock
+        trace_id = self.ingest(agent_id, message)
+        trace = rt.traces[trace_id]
+        trace.significance = significance
+
+        window_start = current.add_m(-BACKTRACE_WINDOW)
+        for t in rt.traces.values():
+            if t.is_deleted():
+                continue
+            if t.born_at.to_m() < window_start.to_m():
+                continue
+            sim = rt.domain.similarity(
+                self._to_content_for_comparison(t),
+                self._to_content_for_comparison(trace),
+            )
+            if sim > 0.5:
+                burst = significance * 0.8
+                if burst > t.significance:
+                    t.significance = burst
+        return trace_id
+
+    # ── 遗忘主循环 ──────────────────────────────────────
+
+    def decay_cycle(self, agent_id: str | None = None) -> dict[str, "DecayReport"]:
+        """
+        遗忘主循环。
+
+        agent_id=None → 遍历所有 agent
+        agent_id=str  → 只处理指定 agent
+        """
+        reports = {}
+        targets = [agent_id] if agent_id else list(self.agents.keys())
+
+        for aid in targets:
+            if aid not in self.agents:
+                continue
+            rt = self._rt(aid)
+            report = DecayReport()
+            current = rt.clock
+
+            for layer in [Layer.L0, Layer.L1, Layer.L2, Layer.L3]:
+                traces_in_layer = [
+                    t for t in rt.traces.values()
+                    if t.layer == layer and not t.is_deleted()
+                ]
+                traces_in_layer.sort(key=lambda t: t.retention(current))
+
+                for trace in traces_in_layer:
+                    if (trace.immunity_until is not None
+                            and current.to_m() < trace.immunity_until.to_m()):
+                        continue
+
+                    hit = self._check_retain_conditions(rt, trace)
+                    if hit:
+                        trace.retained_by = [hit.name]
+                        trace.decay_curve = DecayCurve(
+                            initial=1.0,
+                            lambda_=trace.decay_curve.lambda_,
+                            last_access=current,
+                            access_count=trace.decay_curve.access_count,
+                        )
+                        trace.immunity_until = current.add_m(hit.immunity_m)
+                        self._log(aid, "decay", [trace.id],
+                            f"L{trace.layer.value} retained by '{hit.name}'",
+                            {"retention": trace.retention(current), "immunity_m": hit.immunity_m},
+                            "retained",
+                        )
+                        report.retained += 1
+                        continue
+
+                    r = trace.retention(current)
+                    threshold = self._threshold_for_descend(layer)
+                    if r < threshold:
+                        self._descend(rt, trace)
+                        self._log(aid, "decay", [trace.id],
+                            f"L{layer.value}→L{layer.value+1} descended",
+                            {"retention": r, "threshold": threshold},
+                            "descended",
+                        )
+                        report.descended[layer] += 1
+
+                        if trace.layer == Layer.L4:
+                            self._soft_delete(rt, trace)
+                            self._log(aid, "decay", [trace.id],
+                                f"L4 soft-deleted", {"retention": r}, "deleted")
+                            report.deleted += 1
+
+            reports[aid] = report
+
+        return reports
+
+    # ── 下沉 ─────────────────────────────────────────────
+
+    def _descend(self, rt: AgentRuntime, trace: MemoryTrace) -> None:
+        old_layer = trace.layer
+        new_layer = Layer(old_layer.value + 1)
+        current = rt.clock
+
+        if old_layer == Layer.L0:
+            new_content = self._compress_L0_to_L1(rt, trace.content)
+            compress_detail = "L0→L1: narrative extracted"
+        elif old_layer == Layer.L1:
+            new_content = self._compress_L1_to_L2(rt, trace.content)
+            compress_detail = f"L1→L2: {len(new_content) if isinstance(new_content, list) else 0} patterns"
+        elif old_layer == Layer.L2:
+            new_content = self._compress_L2_to_L3(rt, trace.content)
+            compress_detail = f"L2→L3: {len(new_content) if isinstance(new_content, list) else 0} facts"
+        elif old_layer == Layer.L3:
+            new_content = None
+            compress_detail = "L3→L4: deleted"
+
+        if new_content:
+            child = MemoryTrace(
+                id=generate_id(),
+                layer=new_layer,
+                content=new_content,
+                born_at=current,
+                wall_clock_born=now(),
+                decay_curve=DecayCurve(
+                    initial=1.0,
+                    lambda_=self._base_lambda(),
+                    last_access=current,
+                    access_count=0,
+                ),
+                connectivity_score=self._compute_connectivity_for(rt, new_content),
+                significance=trace.significance * 0.8,
+                retained_by=[],
+                immunity_until=None,
+                parent_trace_ids=[trace.id],
+                child_trace_ids=[],
+                is_first_of_session=False,
+                deleted_at=None,
+            )
+            trace.child_trace_ids.append(child.id)
+            rt.traces[child.id] = child
+            self._log(rt.agent_id, "descend", [trace.id, child.id],
+                compress_detail,
+                {"from_layer": old_layer.value, "to_layer": new_layer.value},
+            )
+
+        trace.layer = new_layer
+
+    # ── 压缩算法 ─────────────────────────────────────────
+
+    def _compress_L0_to_L1(self, rt: AgentRuntime, messages: list[L0_RawMessage]) -> L1_Episode:
+        prompt = f"""
+        将以下对话片段压缩为一条叙事记录，填入固定字段。
+        action_type 从以下选择：{rt.domain.action_types()}
+
+        对话：
+        {self._format_messages(messages)}
+
+        返回 JSON：
+        {{
+            "topic": "语义主题",
+            "action_type": "...",
+            "subject_entity": "核心实体",
+            "predicate": "做了什么/发生了什么",
+            "outcome": "结果/结论",
+            "negation": "明确否定了什么（无则null）",
+            "emotional_tone": -1.0到1.0
+        }}
+        """
+        result = self._call_llm(prompt)
+        return L1_Episode(
+            participants=self._extract_participants(messages),
+            topic=result["topic"],
+            action_type=result["action_type"],
+            subject_entity=result["subject_entity"],
+            predicate=result["predicate"],
+            outcome=result["outcome"],
+            negation=result.get("negation"),
+            emotional_tone=result["emotional_tone"],
+            time=rt.clock,
+            wall_clock=now(),
+            embedding=self._embed(result["topic"] + " " + result["predicate"]),
+        )
+
+    def _compress_L1_to_L2(self, rt: AgentRuntime, episodes: list[L1_Episode]) -> list[L2_Pattern]:
+        patterns = []
+        current = rt.clock
+
+        clusters = self._cluster_by_similarity(
+            episodes, similarity_fn=rt.domain.similarity, threshold=0.6,
+        )
+        for cluster in clusters:
+            if len(cluster) >= 2:
+                patterns.append(L2_Pattern(
+                    type="frequency",
+                    description=self._summarize_frequency_pattern(cluster),
+                    confidence=min(len(cluster) / 5.0, 1.0),
+                    source_episode_ids=[e.id for e in cluster],
+                    evidence_count=len(cluster),
+                    last_observed_at=current,
+                ))
+
+        for entity, eps in self._group_by_entity(episodes).items():
+            if len(eps) >= 2 and len(set(e.outcome for e in eps)) >= 2:
+                patterns.append(L2_Pattern(
+                    type="contrast",
+                    description=self._summarize_contrast_pattern(eps),
+                    confidence=0.7,
+                    source_episode_ids=[e.id for e in eps],
+                    evidence_count=len(eps),
+                    last_observed_at=current,
+                ))
+
+        chains = self._find_causal_chains(episodes, max_depth=4)
+        for chain in chains:
+            patterns.append(L2_Pattern(
+                type="cascade",
+                description=self._describe_chain(chain),
+                confidence=0.85,
+                source_episode_ids=[e.id for e in chain],
+                evidence_count=1,
+                last_observed_at=current,
+            ))
+
+        return patterns
+
+    def _compress_L2_to_L3(self, rt: AgentRuntime, patterns: list[L2_Pattern]) -> list[L3_Fact]:
+        facts = []
+        schema = rt.domain.fact_schema()
+        current = rt.clock
+
+        for pattern in patterns:
+            if pattern.type == "frequency" and pattern.confidence >= 0.8:
+                key, value, sentence = self._pattern_to_fact_kv(pattern, schema)
+                if key and value:
+                    facts.append(L3_Fact(
+                        key=key, value=value, fact_type="identity",
+                        sentence=sentence,
+                        confidence=pattern.confidence,
+                        source_pattern_ids=[pattern.id],
+                        last_updated_at=current,
+                    ))
+
+            if pattern.type == "contrast":
+                key, value, sentence = self._contrast_to_preference(pattern, schema)
+                if key and value:
+                    facts.append(L3_Fact(
+                        key=key, value=value, fact_type="preference",
+                        sentence=sentence,
+                        confidence=pattern.confidence,
+                        source_pattern_ids=[pattern.id],
+                        last_updated_at=current,
+                    ))
+
+            if self._matches_danger_signal(rt, pattern.description):
+                key, value, sentence = self._pattern_to_fact_kv(pattern, schema)
+                if key and value:
+                    facts.append(L3_Fact(
+                        key=key, value=value, fact_type="constraint",
+                        sentence=sentence,
+                        confidence=max(pattern.confidence, 0.5),
+                        source_pattern_ids=[pattern.id],
+                        last_updated_at=current,
+                    ))
+
+        return facts
+
+    # ── 检索 ─────────────────────────────────────────────
+
+    def retrieve(self, agent_id: str, context: "RetrievalContext") -> list[MemoryTrace]:
+        """
+        agent 记忆检索。
+        主动注入（L0+L1）+ 被动唤醒（L2+L3）。
+        """
+        rt = self._rt(agent_id)
+        results = []
+        current = rt.clock
+
+        for trace in self._active_traces(rt):
+            if trace.is_deleted():
+                continue
+            relevance = rt.domain.relevance(trace, context)
+            if relevance > 0.0:
+                trace.decay_curve.access_count += 1
+                trace.decay_curve.last_access = current
+                results.append((trace, relevance, "active"))
+
+        for trace in self._latent_traces(rt):
+            if trace.is_deleted():
+                continue
+            activation = 0.0
+            for cue in context.cues:
+                activation += self._cue_activation(rt, trace, cue)
+
+            if activation >= rt.domain.activation_threshold(trace.layer):
+                trace.decay_curve.access_count += 1
+                trace.decay_curve.last_access = current
+                results.append((trace, activation, "latent"))
+
+        active_count = sum(1 for _, _, path in results if path == "active")
+        latent_count = len(results) - active_count
+        self._log(agent_id, "retrieve", [r[0].id for r in results],
+            f"Retrieved {len(results)} traces",
+            {"active": active_count, "latent": latent_count,
+             "cues": [c.value for c in context.cues]},
+        )
+
+        results.sort(key=lambda x: (0 if x[2] == "active" else 1, -x[1]))
+        return [r[0] for r in results]
+
+    # ── 注入格式渲染 ─────────────────────────────────────
+
+    def render_for_injection(
+        self, agent_id: str, traces: list[MemoryTrace], context: "RetrievalContext"
+    ) -> str:
+        """
+        将 retrieve() 返回的 traces 渲染为最终注入 LLM 的文本块。
+
+        结构：[当前对话] / [背景] / [注意]
+        """
+        rt = self._rt(agent_id)
+        current_session = context.current_session_id
+
+        l0_current, l1_other, l3_facts = [], [], []
+
+        for t in traces:
+            if t.layer == Layer.L0:
+                msg = t.content
+                if msg.session_id == current_session:
+                    l0_current.append(msg)
+            elif t.layer == Layer.L1:
+                l1_other.append(t)
+            elif t.layer == Layer.L3:
+                l3_facts.append(t)
+
+        blocks = []
+
+        if l0_current:
+            blocks.append(f"[当前对话]\n{self._render_dialogue(l0_current)}")
+
+        background_lines = []
+
+        for t in l3_facts:
+            fact = t.content
+            background_lines.append(
+                f"{self._layer_tag(t, rt.clock)} {fact.sentence}"
+            )
+
+        if l1_other:
+            stitched = self._stitch_L1_episodes(agent_id, l1_other)
+            if stitched:
+                background_lines.append(stitched)
+
+        if background_lines:
+            blocks.append(f"[背景]\n" + "\n".join(background_lines))
+
+        conflicts = self._detect_conflicts(l3_facts, l0_current)
+        if conflicts:
+            blocks.append(f"[注意]\n" + "\n".join(conflicts))
+
+        result = "\n\n".join(blocks)
+        self._log(agent_id, "inject", [t.id for t in traces],
+            f"Injection rendered: {len(l0_current)} L0, {len(l1_other)} L1, {len(l3_facts)} L3",
+            {"l0_count": len(l0_current), "l1_count": len(l1_other),
+             "l3_count": len(l3_facts), "conflicts": len(conflicts)},
+        )
+        return result
+
+    def _render_dialogue(self, messages: list[L0_RawMessage]) -> str:
+        return "\n".join(f"[{msg.role}] {msg.text}" for msg in messages)
+
+    def _stitch_L1_episodes(self, agent_id: str, traces: list[MemoryTrace]) -> str:
+        rt = self._rt(agent_id)
+        items = []
+        for t in traces:
+            ep = t.content
+            tone_label = self._tone_label(ep.emotional_tone)
+            items.append(
+                f"[{self._layer_tag(t, rt.clock)}] {ep.predicate}，{ep.outcome} [{tone_label}]"
+            )
+
+        prompt = (
+            "将以下关于用户的记忆片段整合为2-3句连贯的背景描述。"
+            "保留关键信息，去掉重复。不要添加不存在的信息。"
+            "情绪标签仅作为语境的提示，不需要在输出中提及。\n\n"
+            + "\n".join(items)
+        )
+        result = self._call_llm(prompt)
+        stitched = result.get("description", "")
+        self._log(agent_id, "inject", [t.id for t in traces],
+            f"L1 stitched: {len(traces)} episodes → 1 paragraph",
+            {"episode_count": len(traces)}, "stitched",
+        )
+        return stitched
+
+    def _detect_conflicts(
+        self, l3_facts: list[MemoryTrace], l0_messages: list[L0_RawMessage]
+    ) -> list[str]:
+        conflicts = []
+        l0_text = " ".join(m.text for m in l0_messages)
+        if not l0_text:
+            return conflicts
+
+        for t in l3_facts:
+            fact = t.content
+            prompt = (
+                f"判断以下两段信息是否存在矛盾。仅在有明确矛盾时返回 true。\n"
+                f"已知事实: {fact.sentence}\n"
+                f"当前用户消息: {l0_text}\n"
+                f"返回 JSON: {{\"conflict\": true|false, \"detail\": \"矛盾描述或空\"}}"
+            )
+            result = self._call_llm(prompt)
+            if result.get("conflict"):
+                detail = result.get("detail", "")
+                conflicts.append(
+                    f"检测到矛盾——L3 记录为「{fact.sentence}」，"
+                    f"但当前对话中用户反馈「{detail}」。"
+                    f"请综合判断，可能是短期波动或 L3 记录已过时。"
+                )
+
+        return conflicts
+
+    def _layer_tag(self, trace: MemoryTrace, now: TimePosition) -> str:
+        """层级标签 + M-Clock 相对偏移"""
+        dist = now.distance_m(trace.born_at)
+        M = TimePosition
+
+        if dist >= M.M_PER_E:
+            return f"[L{trace.layer.value} -{dist // M.M_PER_E}e]"
+        elif dist >= M.M_PER_V:
+            return f"[L{trace.layer.value} -{dist // M.M_PER_V}v]"
+        elif dist >= M.M_PER_C:
+            c = dist // M.M_PER_C
+            s_rem = (dist % M.M_PER_C) // M.M_PER_S
+            suffix = f"-{c}c{s_rem}s" if s_rem else f"-{c}c"
+            return f"[L{trace.layer.value} {suffix}]"
+        elif dist >= M.M_PER_S:
+            s = dist // M.M_PER_S
+            m_rem = dist % M.M_PER_S
+            suffix = f"-{s}s{m_rem}m" if m_rem else f"-{s}s"
+            return f"[L{trace.layer.value} {suffix}]"
+        else:
+            return f"[L{trace.layer.value} -{dist}m]"
+
+    def _tone_label(self, tone: float) -> str:
+        if tone >= 0.5:   return "积极"
+        elif tone >= 0.1: return "中性偏积极"
+        elif tone >= -0.1: return "中性"
+        elif tone >= -0.5: return "略消极"
+        else:              return "消极"
+
+    def _cue_activation(self, rt: AgentRuntime, trace: MemoryTrace, cue: "Cue") -> float:
+        base = rt.domain.relevance(trace, cue)
+        if trace.layer == Layer.L2:
+            return base
+        elif trace.layer == Layer.L3:
+            return base * 0.6
+        return base
+
+    # ── RetainCondition ──────────────────────────────────
+
+    def _init_retain_conditions(self, rt: AgentRuntime) -> None:
+        M = TimePosition
+        rt.retain_conditions = [
+            RetainCondition(
+                name="显式记忆指令",
+                priority=100,
+                evaluate=lambda t, ctx: _text_contains_any(t.content,
+                    ["记住", "别忘了", "记下来", "remember"]),
+                immunity_m=M.M_PER_V,
+            ),
+            RetainCondition(
+                name="高频提取",
+                priority=80,
+                evaluate=lambda t, ctx:
+                    t.decay_curve.access_count >= 3
+                    and ctx.now.distance_m(t.decay_curve.last_access) <= M.M_PER_C,
+                immunity_m=M.M_PER_C,
+            ),
+            RetainCondition(
+                name="关联锚定",
+                priority=60,
+                evaluate=lambda t, ctx: t.connectivity_score >= 3,
+                immunity_m=M.M_PER_C * 3,
+            ),
+            RetainCondition(
+                name="首因/近因效应",
+                priority=40,
+                evaluate=lambda t, ctx:
+                    t.is_first_of_session
+                    or ctx.now.distance_m(t.born_at) <= M.M_PER_S * 2,
+                immunity_m=M.M_PER_S * 2,
+            ),
+            RetainCondition(
+                name="矛盾标记",
+                priority=90,
+                evaluate=lambda t, ctx: _has_conflict_with_newer(t, rt, ctx.engine),
+                immunity_m=M.M_PER_C * 2,
+            ),
+            RetainCondition(
+                name="领域危险信号",
+                priority=95,
+                evaluate=lambda t, ctx:
+                    rt.domain.is_danger_signal(_extract_text(t.content)),
+                immunity_m=M.M_PER_E,
+            ),
+        ]
+        # 注册领域追加条件
+        for cond in rt.domain.extra_retain_conditions():
+            rt.retain_conditions.append(cond)
+
+    def _check_retain_conditions(
+        self, rt: AgentRuntime, trace: MemoryTrace
+    ) -> RetainCondition | None:
+        ctx = EngineContext(trace=trace, engine=self, now=rt.clock, agent_id=rt.agent_id)
+        for cond in sorted(rt.retain_conditions, key=lambda c: -c.priority):
+            try:
+                if cond.evaluate(trace, ctx):
+                    return cond
+            except Exception:
+                continue
+        return None
+
+    # ── connectivity ──────────────────────────────────────
+
+    def _compute_connectivity(self, rt: AgentRuntime, trace: MemoryTrace) -> int:
+        count = 0
+        for existing in rt.traces.values():
+            if existing.is_deleted():
+                continue
+            sim = rt.domain.similarity(
+                self._to_content_for_comparison(trace),
+                self._to_content_for_comparison(existing),
+            )
+            if sim > 0.5:
+                count += 1
+        return count
+
+    def _compute_connectivity_for(self, rt: AgentRuntime, content) -> int:
+        count = 0
+        for existing in rt.traces.values():
+            if existing.is_deleted():
+                continue
+            if rt.domain.similarity(content, existing.content) > 0.5:
+                count += 1
+        return count
+
+    def _adjusted_lambda(self, connectivity: int) -> float:
+        base = self._base_lambda()
+        if connectivity >= 5:   return base * 0.3
+        elif connectivity >= 3: return base * 0.6
+        elif connectivity >= 1: return base * 0.8
+        else:                   return base
+
+    # ── 阈值与参数 ───────────────────────────────────────
+
+    def _base_lambda(self) -> float:
+        return 0.02
+
+    def _threshold_for_descend(self, layer: Layer) -> float:
+        return {
+            Layer.L0: 0.50,
+            Layer.L1: 0.30,
+            Layer.L2: 0.15,
+            Layer.L3: 0.05,
+        }[layer]
+
+    # ── 软删除与 GC ──────────────────────────────────────
+
+    def _soft_delete(self, rt: AgentRuntime, trace: MemoryTrace) -> None:
+        if (isinstance(trace.content, L3_Fact)
+                and trace.content.fact_type == "constraint"):
+            trace.deleted_at = None
+            trace.layer = Layer.L3
+            trace.decay_curve = DecayCurve(
+                initial=1.0, lambda_=0.005,
+                last_access=rt.clock, access_count=0,
+            )
+            return
+        trace.deleted_at = rt.clock
+
+    def gc(self) -> int:
+        """
+        全局物理清理。遍历所有 agent。
+        双条件：deleted_at ≥ v1 + 90 真实日。
+        """
+        GC_M_WINDOW = TimePosition.M_PER_V
+        GC_WALL_CLOCK_DAYS = 90
+        cutoff = now() - timedelta(days=GC_WALL_CLOCK_DAYS)
+        total_deleted = 0
+
+        for agent_id, rt in self.agents.items():
+            to_delete = []
+            for tid, t in rt.traces.items():
+                if t.deleted_at is None:
+                    continue
+                if (isinstance(t.content, L3_Fact)
+                        and t.content.fact_type == "constraint"):
+                    continue
+                if (rt.clock.distance_m(t.deleted_at) >= GC_M_WINDOW
+                        and t.wall_clock_born < cutoff):
+                    to_delete.append(tid)
+
+            for tid in to_delete:
+                del rt.traces[tid]
+            total_deleted += len(to_delete)
+
+            if to_delete:
+                self._log(agent_id, "gc", to_delete,
+                    f"GC purged {len(to_delete)} traces",
+                    {"count": len(to_delete)},
+                )
+
+        return total_deleted
+
+    def check_abandonment(self, agent_id: str) -> bool:
+        rt = self._rt(agent_id)
+        return (now() - rt.wall_clock_start).days >= 90
+
+    # ── 容量触发 ─────────────────────────────────────────
+
+    def _maybe_trigger_capacity_check(self, rt: AgentRuntime, layer: Layer):
+        capacity_limits = {
+            Layer.L0: 15, Layer.L1: 30, Layer.L2: 20, Layer.L3: 50,
+        }
+        limit = capacity_limits.get(layer, 100)
+        active = [t for t in rt.traces.values()
+                  if t.layer == layer and not t.is_deleted()]
+
+        if len(active) <= limit:
+            return
+
+        current = rt.clock
+        active.sort(key=lambda t:
+            t.m_since_born(current)
+            * (1.0 - t.retention(current))
+            * (1.0 - t.significance),
+            reverse=True,
+        )
+        for v in active[int(limit * 0.7):]:
+            self._descend(rt, v)
+
+    # ── 工具方法 ─────────────────────────────────────────
+
+    def _to_content_for_comparison(self, trace_or_episode) -> Any:
+        if hasattr(trace_or_episode, 'content'):
+            return trace_or_episode.content
+        return trace_or_episode
+
+    def _cluster_by_similarity(
+        self, items: list, similarity_fn: Callable, threshold: float
+    ) -> list[list]:
+        clusters = []
+        for item in items:
+            best_cluster = None
+            best_sim = threshold
+            for c in clusters:
+                avg_sim = mean(similarity_fn(item, member) for member in c)
+                if avg_sim > best_sim:
+                    best_sim = avg_sim
+                    best_cluster = c
+            if best_cluster:
+                best_cluster.append(item)
+            else:
+                clusters.append([item])
+        return clusters
+
+    def _find_causal_chains(
+        self, episodes: list[L1_Episode], max_depth: int
+    ) -> list[list[L1_Episode]]:
+        chains = []
+        sorted_eps = sorted(episodes, key=lambda e: e.time.to_m())
+        visited = set()
+
+        for i, start in enumerate(sorted_eps):
+            if i in visited:
+                continue
+            chain = [start]
+            current_ep = start
+            for j in range(i + 1, len(sorted_eps)):
+                if j in visited:
+                    continue
+                candidate = sorted_eps[j]
+                if cosine_sim(
+                    self._embed(current_ep.outcome),
+                    self._embed(candidate.subject_entity),
+                ) > 0.6:
+                    chain.append(candidate)
+                    visited.add(j)
+                    current_ep = candidate
+                    if len(chain) >= max_depth:
+                        break
+            if len(chain) >= 2:
+                chains.append(chain)
+                visited.add(i)
+
+        return chains
+
+    def _embed(self, text: str) -> list[float]: ...
+    def _call_llm(self, prompt: str) -> dict: ...
+
+    def _format_messages(self, messages: list[L0_RawMessage]) -> str:
+        return "\n".join(f"[{m.role}] {m.text}" for m in messages)
+
+    def _extract_participants(self, messages: list[L0_RawMessage]) -> list[str]:
+        return list(set(m.role for m in messages))
+
+    def _summarize_frequency_pattern(self, cluster) -> str:
+        return self._call_llm(f"总结模式：\n{cluster}")["description"]
+
+    def _summarize_contrast_pattern(self, episodes) -> str:
+        return self._call_llm(f"总结对比模式：\n{episodes}")["description"]
+
+    def _describe_chain(self, chain) -> str:
+        steps = " → ".join(e.outcome for e in chain)
+        return f"因果链：{chain[0].subject_entity} → {steps}"
+
+    def _group_by_entity(self, episodes) -> dict[str, list]:
+        groups = {}
+        for ep in episodes:
+            groups.setdefault(ep.subject_entity, []).append(ep)
+        return groups
+
+    def _pattern_to_fact_kv(self, pattern, schema) -> tuple[str, Any, str]:
+        result = self._call_llm(
+            f"将模式描述映射到 schema 的 key-value，并生成一句自然语言描述。"
+            f"schema={schema}, 模式={pattern.description}"
+            f"返回 JSON: {{\"key\": \"...\", \"value\": \"...\", \"sentence\": \"...\"}}"
+        )
+        return result.get("key"), result.get("value"), result.get("sentence", "")
+
+    def _contrast_to_preference(self, pattern, schema) -> tuple[str, Any, str]:
+        return self._pattern_to_fact_kv(pattern, schema)
+
+    def _matches_danger_signal(self, rt: AgentRuntime, text: str) -> bool:
+        return rt.domain.is_danger_signal(text)
+
+    def _active_traces(self, rt: AgentRuntime) -> list[MemoryTrace]:
+        return [t for t in rt.traces.values()
+                if t.layer in (Layer.L0, Layer.L1) and not t.is_deleted()]
+
+    def _latent_traces(self, rt: AgentRuntime) -> list[MemoryTrace]:
+        return [t for t in rt.traces.values()
+                if t.layer in (Layer.L2, Layer.L3) and not t.is_deleted()]
+
+
+# ── 辅助类型 ──────────────────────────────────────────────
+
+@dataclass
+class RetrievalContext:
+    current_session_id: str
+    recent_messages: list[str]
+    cues: list["Cue"]
+    domain_hints: dict
+
+
+@dataclass
+class Cue:
+    type: str      # "entity" | "topic" | "action" | "emotion"
+    value: str
+    weight: float  # 0.0 ~ 1.0
+
+
+@dataclass
+class EngineContext:
+    trace: MemoryTrace
+    engine: "ForgettingEngine"
+    now: TimePosition
+    agent_id: str
+
+
+@dataclass
+class DecayReport:
+    retained: int = 0
+    descended: dict[Layer, int] = field(default_factory=lambda: defaultdict(int))
+    deleted: int = 0
+
+
+@dataclass
+class FactField:
+    type: str
+    values: list | None = None
+    element: str | None = None
+    key: str | None = None
+    unit: str | None = None
+
+
+# ── 辅助函数 ─────────────────────────────────────────────
+
+def _text_contains_any(content, keywords: list[str]) -> bool:
+    return any(kw in _extract_text(content) for kw in keywords)
+
+
+def _extract_text(content) -> str:
+    if isinstance(content, L0_RawMessage):
+        return content.text
+    if isinstance(content, L1_Episode):
+        return f"{content.predicate} {content.outcome}"
+    if isinstance(content, L2_Pattern):
+        return content.description
+    if isinstance(content, L3_Fact):
+        return content.sentence or f"{content.key}: {content.value}"
+    return str(content)
+
+
+def _has_conflict_with_newer(trace: MemoryTrace, rt: AgentRuntime, engine: "ForgettingEngine") -> bool:
+    for other in rt.traces.values():
+        if other.born_at.to_m() <= trace.born_at.to_m() or other.is_deleted():
+            continue
+        sim = rt.domain.similarity(
+            engine._to_content_for_comparison(trace),
+            engine._to_content_for_comparison(other),
+        )
+        if sim > 0.7 and _outcome_conflicts(trace, other):
+            return True
+    return False
+
+
+def _outcome_conflicts(a: MemoryTrace, b: MemoryTrace) -> bool:
+    return False  # 实际：语义矛盾检测
+
+
+# ============================================================
+# 使用示例
+# ============================================================
+
+# engine = ForgettingEngine()
+# ForgettingEngine.register_domain("skincare", SkincareAdapter)
+# ForgettingEngine.register_domain("coding", CodingAssistantAdapter)
+#
+# sk = engine.create_agent("sk_001", "skincare")
+# code = engine.create_agent("code_001", "coding")
+# # 两个 agent 独立 clock + 独立 traces，共享一个引擎进程
+#
+# engine.ingest(sk, L0_RawMessage(
+#     role="user", text="昨天试了理肤泉B5，红的地方退了一点...",
+#     time=TimePosition(), wall_clock=now(), session_id="s1",
+# ))
+# # sk clock = e0.v0.c0.s0.m1  （code clock 不受影响）
+#
+# engine.ingest_significant(sk, L0_RawMessage(
+#     role="user", text="记住，我对水杨酸完全不耐受",
+#     time=TimePosition(), wall_clock=now(), session_id="s2",
+# ), significance=1.0)
+#
+# reports = engine.decay_cycle()  # 全局，遍历所有 agent
+# # → {"sk_001": DecayReport(retained=2,...), "code_001": DecayReport(...)}
+#
+# traces = engine.retrieve(sk, RetrievalContext(
+#     current_session_id="s3",
+#     recent_messages=["最近皮肤有点敏感..."],
+#     cues=[Cue(type="entity", value="B5", weight=0.8)],
+#     domain_hints={},
+# ))
+# prompt = engine.render_for_injection(sk, traces, ctx)
+#
+# # 日志
+# engine.logger.recent(20)
+# engine.logger.by_operation("decay")
