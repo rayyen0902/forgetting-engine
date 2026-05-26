@@ -1100,7 +1100,8 @@ class ForgettingEngine:
             * (1.0 - t.significance),
             reverse=True,
         )
-        for v in active[int(limit * 0.7):]:
+        # reverse=True → 高分（最该淘汰）排前面 → 取头部
+        for v in active[:-limit]:
             self._descend(rt, v)
 
     # ── 工具方法 ─────────────────────────────────────────
@@ -1320,3 +1321,810 @@ def _outcome_conflicts(a: MemoryTrace, b: MemoryTrace) -> bool:
 # # 日志
 # engine.logger.recent(20)
 # engine.logger.by_operation("decay")
+
+
+# ============================================================
+# 领域插件：SkincareAdapter（护肤）
+# ============================================================
+# 护肤领域的对话模式：
+#   咨询（肤质/问题/产品）→ 推荐 → 反馈 → 调整
+#   核心实体：产品、成分、肤质、皮肤问题、routine
+#   危险信号：过敏、烂脸、激素、灼烧
+#
+# 护肤领域特有的信息衰减规律：
+#   - 产品反馈在 1v（一个使用周期）内高度相关，之后衰减快
+#   - 过敏/不耐受 永久保留（constraint）
+#   - 肤质声明 半永久（季节性变化才更新）
+#   - routine 变更频繁，旧 routine 属于情景记忆
+# ============================================================
+
+
+# ── 护肤领域 Schema ──────────────────────────────────────
+
+class SkincareFactSchema:
+    """
+    护肤领域 L3 事实的字段定义。
+    每个 key 都是皮肤档案中的一个维度。
+    """
+
+    SCHEMA = {
+        # ── 身份级（identity）──
+        "skin_type": FactField(
+            type="enum",
+            values=["oily", "dry", "combination", "normal", "sensitive"],
+        ),
+        "skin_concerns": FactField(
+            type="set",
+            values=[
+                "acne", "closed_comedones", "blackheads",
+                "pores", "roughness",
+                "redness", "rosacea", "eczema",
+                "wrinkles", "firmness",
+                "dullness", "uneven_tone", "dark_spots", "melasma",
+                "dehydration", "oil_imbalance",
+                "sensitivity", "allergy_prone",
+            ],
+        ),
+        "oil_level": FactField(type="range", min=1, max=5),
+        "hydration": FactField(type="range", min=1, max=5),
+        "sensitivity": FactField(type="range", min=1, max=5),
+
+        # ── 偏好级（preference）──
+        "budget_level": FactField(
+            type="enum", values=["drugstore", "mid_range", "premium", "luxury"],
+        ),
+        "texture_preference": FactField(
+            type="set", values=["light", "fresh", "rich", "gel", "cream", "lotion", "balm", "oil"],
+        ),
+        "fragrance_preference": FactField(
+            type="enum", values=["fragrance_free", "light_scent", "no_preference"],
+        ),
+        "brand_affinity": FactField(type="set", element="string"),
+        "brand_avoid": FactField(type="set", element="string"),
+        "routine_style": FactField(
+            type="enum", values=["minimalist", "standard", "elaborate", "k_beauty"],
+        ),
+        "sunscreen_habit": FactField(
+            type="enum", values=["daily", "outdoor_only", "occasional", "never"],
+        ),
+        "vegan_preference": FactField(type="boolean"),
+        "alcohol_free_preference": FactField(type="boolean"),
+
+        # ── 约束级（constraint）──
+        "allergies": FactField(type="set", element="ingredient"),
+        "intolerances": FactField(type="set", element="ingredient"),
+        "contraindicated_products": FactField(type="set", element="string"),
+        "medical_conditions": FactField(type="set", element="string"),
+
+        # ── 宪章·风险档案（对应《AI 护肤助理宪章》第三/五章）──
+        "is_svip": FactField(type="boolean"),
+        "special_protection": FactField(
+            type="set",
+            values=["minor", "pregnant", "nursing", "trying_to_conceive",
+                    "immunosuppressed", "cancer_treatment", "oral_retinoid"],
+        ),
+        "high_risk_flags": FactField(
+            type="set",
+            values=["acute_infection", "systemic_spread", "eye_involved",
+                    "anaphylaxis_risk", "suspicious_lesion", "child"],
+        ),
+        "image_analysis_performed": FactField(type="boolean"),
+    }
+
+
+# ── action_types ──────────────────────────────────────────
+
+SKINCARE_ACTION_TYPES = [
+    # 咨询类
+    "consult_skin_type",          # 问"我是什么肤质"
+    "consult_concern",            # 问具体问题（痘痘、皱纹...）
+    "consult_product",            # 问某个产品是否适合
+    "consult_routine",            # 问routine怎么搭
+    "consult_ingredient",         # 问某个成分的作用
+    "consult_seasonal",           # 换季调整
+
+    # 反馈类
+    "report_result_positive",     # 用了XX，效果不错
+    "report_result_neutral",      # 没感觉
+    "report_result_negative",     # 用了XX，闷痘/刺痛
+    "report_reaction",            # 过敏反应
+    "report_skin_change",         # 皮肤状态变化（换季/压力/经期）
+
+    # 行为类
+    "log_routine",                # 记录当前routine
+    "log_product_start",          # 开始用一个新产品
+    "log_product_stop",           # 停用某产品
+    "log_skin_status",            # 记录当天的皮肤状态
+
+    # 决策类
+    "purchase_inquiry",           # 想买XX，值得吗
+    "compare_products",           # A vs B 对比
+    "set_preference",             # 偏好声明（我喜欢...）
+    "set_constraint",             # 约束声明（我不能用...）
+    "request_timeline",           # 问多久见效
+
+    # 紧急类
+    "emergency_breakout",         # 突然爆痘
+    "emergency_reaction",         # 严重过敏
+    "emergency_burn",             # 刷酸翻车/灼烧
+
+    # ── 宪章要求（第四章第四条：拒绝/劝导/转介）──
+    "refuse_medical_request",      # 拒绝医疗诊断/用药请求
+    "refer_to_clinic",             # 转介线下就医（附理由）
+    "downgrade_to_basic_care",     # 高风险 → 基础护理（清洁-保湿-防晒）
+    "report_high_risk_signal",     # 用户报告高风险症状
+    "disclose_non_medical",        # 声明非医疗边界
+    "request_image_analysis",      # 用户请求分析照片
+    "disclose_image_boundary",     # 图像分析前声明「不做诊断级结论」
+]
+
+
+# ── danger_signals ────────────────────────────────────────
+
+SKINCARE_DANGER_SIGNALS = [
+    # ── A. 感染与急性炎症（第三章第三条 A）──
+    "脓疱密集", "黄色结痂", "渗出流水", "恶臭",
+    "红肿热痛", "皮肤发烫",
+    "水疱成簇", "糜烂面扩大", "出血不止",
+
+    # ── B. 扩散与全身关联（第三章第三条 B）──
+    "皮疹扩散", "快速扩散",
+    "发热", "寒战", "淋巴结肿大", "意识模糊",
+
+    # ── C. 特殊部位高风险（第三章第三条 C）──
+    "眼周红肿", "视物模糊", "睁眼困难",
+    "口周糜烂", "鼻周糜烂",
+
+    # ── D. 过敏与药物不良反应（第三章第三条 D）──
+    "大面积风团", "面部肿胀", "喉头紧", "喘鸣",
+    "表皮剥脱", "广泛水疱",
+    "过敏性休克", "anaphylaxis",
+
+    # ── E. 色素与肿物高风险信号（第三章第三条 E）──
+    "黑痣变大", "黑痣变深", "边缘不规则", "破溃出血",
+    "新生物快速增长", "反复破溃不愈",
+
+    # ── 通用高危 ──
+    "烂脸", "灼烧", "溃烂",
+    "激素脸", "激素依赖",
+    "刺痛难忍", "脱皮严重", "红肿不退",
+    "大面积爆痘", "化脓", "疤痕",
+
+    # ── F/G. 特殊人群触发词（第三章第五条）──
+    "婴幼儿", "孕妇", "哺乳期", "备孕",
+    "免疫抑制", "长期口服维A酸",
+    "化疗", "放疗", "白血病",
+]
+
+
+# ── Adapter 主体 ──────────────────────────────────────────
+
+class SkincareAdapter(DomainAdapter):
+    """
+    护肤领域适配器。
+
+    设计要点：
+    1. 相似度 = 实体重叠 + 语义相似 + 时间衰减
+    2. relevance 按 trace 层级使用不同策略
+    3. 过敏/不耐受 → constraint，免疫有效期 = 永久（1e）
+    4. feedback 类消息的 L1↓L2 使用专门的产品-效果聚合
+    """
+
+    # ── 接口实现 ──────────────────────────────────────────
+
+    def action_types(self) -> list[str]:
+        return SKINCARE_ACTION_TYPES
+
+    def fact_schema(self) -> dict[str, FactField]:
+        return SkincareFactSchema.SCHEMA
+
+    def danger_signals(self) -> list[str]:
+        return SKINCARE_DANGER_SIGNALS
+
+    def activation_threshold(self, layer: Layer) -> float:
+        """
+        L2 比默认更容易唤醒（护肤行为模式线索多）
+        L3 比默认更难唤醒（防止无关事实污染当前对话）
+        """
+        return {
+            Layer.L2: 0.35,   # 默认 0.5，护肤场景模式多，降低阈值
+            Layer.L3: 0.55,   # 默认 0.5，护肤 L3 精准度要求高
+        }.get(layer, 0.5)
+
+    # ── 相似度 ─────────────────────────────────────────────
+
+    def similarity(self, a, b) -> float:
+        """
+        混合相似度：实体 Jaccard + embedding cosine。
+        权重：实体 0.45 + 语义 0.55。
+        """
+        text_a = _extract_text(a)
+        text_b = _extract_text(b)
+
+        entities_a = self._extract_skincare_entities(text_a)
+        entities_b = self._extract_skincare_entities(text_b)
+
+        entity_sim = self._jaccard(entities_a, entities_b) if entities_a or entities_b else 0.0
+        semantic_sim = cosine_sim(embed(text_a), embed(text_b))
+
+        return 0.45 * entity_sim + 0.55 * semantic_sim
+
+    def _jaccard(self, set_a: set, set_b: set) -> float:
+        if not set_a and not set_b:
+            return 0.0
+        inter = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return inter / union if union > 0 else 0.0
+
+    # ── 相关性 ─────────────────────────────────────────────
+
+    def relevance(self, trace: MemoryTrace, context: RetrievalContext) -> float:
+        """
+        分层的相关性计算。
+        L0：直接文本匹配 → 总是高于阈值（主动注入层）
+        L1：实体+语义，时间衰减
+        L2+L3：线索激活模式（被动唤醒层，在 retrieve() 中累计）
+        """
+        if trace.layer == Layer.L0:
+            return 1.0   # L0 总是注入（本会话的原始消息）
+
+        trace_text = _extract_text(trace.content)
+        trace_entities = self._extract_skincare_entities(trace_text)
+
+        # 实体匹配得分
+        cue_entities = set()
+        for cue in context.cues:
+            cue_entities.update(self._extract_skincare_entities(cue.value))
+        entity_score = self._jaccard(trace_entities, cue_entities)
+
+        # 关键词匹配
+        keyword_score = 0.0
+        all_cue_text = " ".join(c.value for c in context.cues)
+        if all_cue_text:
+            for entity in trace_entities:
+                if entity.lower() in all_cue_text.lower():
+                    keyword_score += 0.3
+
+        # 语义匹配
+        cue_tokens = " ".join(c.value for c in context.cues)
+        semantic_score = cosine_sim(embed(trace_text), embed(cue_tokens))
+
+        # 综合：实体 0.4 + 关键词 0.2 + 语义 0.4
+        raw = 0.4 * entity_score + 0.2 * min(keyword_score, 1.0) + 0.4 * semantic_score
+
+        # 护肤特有的时间加权：产品反馈和皮肤变化在近期权重更高
+        if isinstance(trace.content, L1_Episode):
+            ep = trace.content
+            if ep.action_type in (
+                "report_result_positive", "report_result_negative",
+                "report_reaction", "report_skin_change",
+            ):
+                # 反馈类：1v 内加权 x1.5，超过 2v 后降权
+                m_since = trace.m_since_born(trace.born_at)  # placeholder
+                if m_since <= TimePosition.M_PER_V:
+                    raw *= 1.5
+                elif m_since > TimePosition.M_PER_V * 2:
+                    raw *= 0.7
+
+        return min(raw, 1.0)
+
+    # ── 额外保留条件 ───────────────────────────────────────
+
+    def extra_retain_conditions(self) -> list[RetainCondition]:
+        """
+        护肤领域特有的保留条件。
+
+        优先级设计：
+          显式指令(100) > 危险信号(95) > 护肤·宪章硬红线(92)
+          > 护肤·特殊人群(88) > 护肤·过敏(85) > 高频提取(80)
+          > 护肤·约束(75) > 关联锚定(60) > 护肤·有效产品(50)
+          > 护肤·肤质档案(45) > 首因近因(40) > 护肤·反馈链(30)
+        """
+        M = TimePosition
+        return [
+            RetainCondition(
+                name="护肤·过敏/不耐受声明",
+                priority=85,
+                evaluate=lambda t, ctx: (
+                    isinstance(t.content, L1_Episode)
+                    and t.content.action_type == "report_reaction"
+                    and t.content.emotional_tone <= -0.5
+                ),
+                immunity_m=M.M_PER_E,
+            ),
+            RetainCondition(
+                name="护肤·约束声明",
+                priority=75,
+                evaluate=lambda t, ctx: _text_contains_any(t.content, [
+                    "不耐受", "过敏", "不能用", "严重过敏",
+                    "禁忌", "医生说不", "皮肤科",
+                ]),
+                immunity_m=M.M_PER_E,
+            ),
+            RetainCondition(
+                name="护肤·有效产品确认",
+                priority=50,
+                evaluate=lambda t, ctx: (
+                    isinstance(t.content, L1_Episode)
+                    and t.content.action_type == "report_result_positive"
+                    and t.content.emotional_tone >= 0.5
+                ),
+                immunity_m=M.M_PER_V * 2,
+            ),
+            RetainCondition(
+                name="护肤·肤质/档案声明",
+                priority=45,
+                evaluate=lambda t, ctx: (
+                    isinstance(t.content, L1_Episode)
+                    and t.content.action_type in (
+                        "consult_skin_type", "set_preference",
+                        "log_skin_status", "set_constraint",
+                    )
+                ),
+                immunity_m=M.M_PER_V * 3,
+            ),
+            RetainCondition(
+                name="护肤·宪章硬红线",
+                priority=92,
+                evaluate=lambda t, ctx: (
+                    isinstance(t.content, L1_Episode)
+                    and t.content.action_type in (
+                        "refuse_medical_request", "refer_to_clinic",
+                        "downgrade_to_basic_care", "report_high_risk_signal",
+                    )
+                ),
+                immunity_m=M.M_PER_E,
+            ),
+            RetainCondition(
+                name="护肤·特殊人群声明",
+                priority=88,
+                evaluate=lambda t, ctx: _text_contains_any(
+                    t.content,
+                    ["孕妇", "哺乳期", "备孕", "婴幼儿", "化疗", "白血病",
+                     "免疫抑制", "长期口服维A酸"],
+                ),
+                immunity_m=M.M_PER_E,
+            ),
+            RetainCondition(
+                name="护肤·反馈链保护",
+                priority=30,
+                evaluate=lambda t, ctx: (
+                    isinstance(t.content, L2_Pattern)
+                    and t.content.type == "cascade"
+                    and t.content.confidence >= 0.6
+                ),
+                immunity_m=M.M_PER_V,
+            ),
+        ]
+
+    # ── 实体提取 ───────────────────────────────────────────
+
+    # 护肤领域实体词典（原型用硬编码，商用可用 NER 模型）
+    _ENTITY_PATTERNS: dict[str, list[str]] = {
+        # 成分
+        "ingredient": [
+            "水杨酸", "果酸", "壬二酸", "杏仁酸", "甘醇酸", "乳酸",
+            "烟酰胺", "维A醇", "视黄醇", "A醇", "A酸", "A醛",
+            "维C", "VC", "抗坏血酸", "乙基维C",
+            "玻尿酸", "透明质酸", "B5", "泛醇", "神经酰胺",
+            "胜肽", "多肽", "蓝铜胜肽", "六胜肽",
+            "茶树精油", "金缕梅", "积雪草", "马齿苋",
+            "角鲨烷", "荷荷巴油", "玫瑰果油",
+            "酒精", "香精", "防腐剂", "矿物油",
+            "虾青素", "艾地苯", "富勒烯", "依克多因",
+            "壬二酸", "传明酸", "熊果苷", "曲酸", "377",
+            "白藜芦醇", "绿茶多酚", "枸杞",
+        ],
+        # 产品类别
+        "product_category": [
+            "洁面", "洗面奶", "卸妆", "水", "精华", "乳液", "面霜",
+            "防晒", "隔离", "面膜", "眼霜", "颈霜",
+            "酸类精华", "修复霜", "保湿霜", "控油",
+            "A醇精华", "VC精华", "B5精华", "烟酰胺精华",
+        ],
+        # 品牌
+        "brand": [
+            "理肤泉", "雅漾", "适乐肤", "丝塔芙", "珂润",
+            "修丽可", "欧邦琪", "ZO", "Jan Marini",
+            "兰蔻", "雅诗兰黛", "资生堂", "CPB", "莱珀妮",
+            "HBN", "珀莱雅", "薇诺娜", "玉泽", "相宜本草",
+            "露得清", "欧莱雅", "OLAY", "宝拉珍选",
+            "茵芙纱", "IPSA", "黛珂", "ALBION",
+            "SK-II", "海蓝之谜", "赫莲娜",
+        ],
+        # 皮肤问题
+        "skin_concern": [
+            "痘痘", "闭口", "黑头", "粉刺", "痤疮",
+            "红血丝", "泛红", "敏感", "刺痛",
+            "毛孔", "粗糙", "暗沉", "肤色不均", "痘印", "斑点",
+            "细纹", "皱纹", "松弛", "法令纹", "鱼尾纹",
+            "干燥", "起皮", "脱皮", "出油", "油光",
+            "黑眼圈", "眼袋", "泪沟",
+        ],
+    }
+
+    # 扁平化：entity_text → category
+    _FLAT_ENTITIES: dict[str, str] = {}
+    _INITIALIZED = False
+
+    @classmethod
+    def _init_entities(cls):
+        if cls._INITIALIZED:
+            return
+        for category, terms in cls._ENTITY_PATTERNS.items():
+            for term in terms:
+                cls._FLAT_ENTITIES[term.lower()] = category
+        cls._INITIALIZED = True
+
+    def _extract_skincare_entities(self, text: str) -> set[str]:
+        """从文本中提取护肤领域实体"""
+        self._init_entities()
+        found = set()
+        text_lower = text.lower()
+        for term, category in self._FLAT_ENTITIES.items():
+            if term in text_lower:
+                found.add(f"{category}:{term}")
+        return found
+
+
+# ── 护肤专用的 L1 压缩补充 ────────────────────────────────
+
+class SkincareL1Compressor:
+    """
+    护肤 L0→L1 的领域特化逻辑。
+
+    通用引擎的 _compress_L0_to_L1() 调用 LLM 模板提取，
+    护肤需要在 prompt 中加入领域 action_types 即可，
+    这部分不需要重写。以下补充护肤特有的后处理。
+    """
+
+    @staticmethod
+    def post_process(episode: L1_Episode, messages: list[L0_RawMessage]) -> L1_Episode:
+        """
+        LLM 提取 L1_Episode 后，护肤领域的补充处理：
+        1. 从文本中抽取产品名、成分名填充 entity tags
+        2. 识别是否为 "第一条反馈"（产品 trial 的开始）
+        """
+        all_text = " ".join(m.text for m in messages)
+        adapter = SkincareAdapter()
+        entities = adapter._extract_skincare_entities(all_text)
+
+        # 产品试用的第一条反馈标记
+        # 如果 action_type 是 report_* 且没有找到之前的产品引用
+        # 则这可能是 trial 的起点
+        episode.is_trial_start = (
+            episode.action_type.startswith("report_")
+            and not any("product:" in e for e in entities)
+        )
+
+        return episode
+
+
+# ── 护肤 L2 模式归纳 ──────────────────────────────────────
+
+class SkincareL2InductionStrategy:
+    """
+    护肤 L1→L2 的领域特化归纳。
+
+    通用引擎已有三种策略（frequency/contrast/cascade），
+    护肤需要在此基础上增加以下模式：
+
+    1. 产品-效果对 (product_effect_pair)
+       多个 L1 提到同一产品的效果 → 归纳为产品评价模式
+
+    2. 成分-反应链 (ingredient_reaction_chain)
+       同一成分多次出现负面反馈 → 潜在的过敏/不耐受模式
+
+    3. 周期性模式 (cyclical_pattern)
+       某种皮肤问题反复出现在某些条件下 → 周期性诱因模式
+    """
+
+    @staticmethod
+    def extract_product_effect_pairs(
+        episodes: list[L1_Episode],
+        entity_extractor,
+    ) -> list[L2_Pattern]:
+        """
+        从 episodes 中识别 「产品 → 效果」 的配对。
+        例如：3 次提到 B5 → 退红 → 归纳为"B5 对泛红有效"
+        """
+        patterns = []
+        product_effects: dict[str, list[L1_Episode]] = {}
+
+        for ep in episodes:
+            text = f"{ep.subject_entity} {ep.predicate} {ep.outcome}"
+            entities = entity_extractor(text)
+            products = [e for e in entities if e.startswith("brand:") or e.startswith("ingredient:")]
+            for p in products:
+                product_effects.setdefault(p, []).append(ep)
+
+        for product, eps in product_effects.items():
+            if len(eps) >= 2:
+                positive = sum(1 for e in eps if e.emotional_tone > 0)
+                negative = sum(1 for e in eps if e.emotional_tone < -0.3)
+                confidence = len(eps) / (len(eps) + 2)  # 贝叶斯平滑
+
+                patterns.append(L2_Pattern(
+                    type="product_effect",
+                    description=(
+                        f"产品 {product}：{len(eps)} 次提及，"
+                        f"正面 {positive} 次 / 负面 {negative} 次"
+                    ),
+                    confidence=confidence,
+                    source_episode_ids=[e.id for e in eps],
+                    evidence_count=len(eps),
+                    last_observed_at=eps[-1].time,
+                ))
+
+        return patterns
+
+    @staticmethod
+    def extract_ingredient_reactions(
+        episodes: list[L1_Episode],
+        entity_extractor,
+        danger_signals: list[str],
+    ) -> list[L2_Pattern]:
+        """
+        识别成分→负面反应的关联。
+        多个 episode 中同一成分 + 负面/危险信号 → 潜在不耐受。
+        """
+        patterns = []
+        ingredient_negatives: dict[str, list[L1_Episode]] = {}
+
+        for ep in episodes:
+            text = f"{ep.subject_entity} {ep.predicate} {ep.outcome} {ep.negation or ''}"
+            if ep.emotional_tone > -0.2:
+                continue  # 只看负面
+
+            entities = entity_extractor(text)
+            ingredients = [e for e in entities if e.startswith("ingredient:")]
+
+            is_negative = (
+                ep.emotional_tone <= -0.5
+                or any(sig in text for sig in danger_signals)
+                or ep.action_type in ("report_reaction", "report_result_negative")
+            )
+            if not is_negative:
+                continue
+
+            for ing in ingredients:
+                ingredient_negatives.setdefault(ing, []).append(ep)
+
+        for ing, eps in ingredient_negatives.items():
+            if len(eps) >= 2:
+                patterns.append(L2_Pattern(
+                    type="ingredient_reaction",
+                    description=(
+                        f"成分 {ing} 关联 {len(eps)} 次负面反应，"
+                        f"可能为不耐受成分"
+                    ),
+                    confidence=min(len(eps) / 3.0, 0.95),
+                    source_episode_ids=[e.id for e in eps],
+                    evidence_count=len(eps),
+                    last_observed_at=eps[-1].time,
+                ))
+
+        return patterns
+
+    @staticmethod
+    def extract_cyclical_patterns(
+        episodes: list[L1_Episode],
+    ) -> list[L2_Pattern]:
+        """
+        识别周期性模式：同一皮肤问题在不同时间反复出现。
+        例如：每到换季就敏感、经期前爆痘、压力大时长闭口。
+        """
+        patterns = []
+        concern_episodes: dict[str, list[L1_Episode]] = {}
+
+        for ep in episodes:
+            text = f"{ep.subject_entity} {ep.outcome}"
+            entities = set()  # simplified
+            concerns = [e for e in entities if e.startswith("skin_concern:")]
+            for c in concerns:
+                concern_episodes.setdefault(c, []).append(ep)
+
+        for concern, eps in concern_episodes.items():
+            if len(eps) < 3:
+                continue
+            # 检查时间间距是否有规律性
+            times = sorted([e.time.to_m() for e in eps])
+            gaps = [times[i] - times[i-1] for i in range(1, len(times))]
+            if not gaps:
+                continue
+            mean_gap = sum(gaps) / len(gaps)
+            cv = std(gaps) / mean_gap if mean_gap > 0 else 999  # 变异系数
+
+            if cv < 0.5 and mean_gap >= TimePosition.M_PER_C:
+                patterns.append(L2_Pattern(
+                    type="cyclical",
+                    description=(
+                        f"皮肤问题 {concern} 呈现周期性，"
+                        f"平均间隔约 {mean_gap / TimePosition.M_PER_C:.1f} 章"
+                    ),
+                    confidence=min(len(eps) / 5.0, 0.8),
+                    source_episode_ids=[e.id for e in eps],
+                    evidence_count=len(eps),
+                    last_observed_at=eps[-1].time,
+                ))
+
+        return patterns
+
+
+# ── 护肤 L3 冲突检测 ──────────────────────────────────────
+
+class SkincareConflictDetector:
+    """
+    护肤特有的 L3 冲突/矛盾检测。
+
+    通用引擎已有 L3↔L0 冲突检测（_detect_conflicts），
+    护肤补充以下检测：
+    """
+
+    @staticmethod
+    def check_fact_vs_new_claim(
+        existing_fact: L3_Fact,
+        new_claim: L1_Episode,
+    ) -> dict | None:
+        """
+        检测已有 L3 事实是否与新声明矛盾。
+
+        典型场景：
+        - 旧 fact: skin_type=oily，新 claim: "最近脸很干"
+          → 不是矛盾，是短期波动
+        - 旧 fact: allergies 含"水杨酸"，新 claim: "我在用水杨酸棉片"
+          → 矛盾！可能用户忘了自己过敏，或者过敏已脱敏
+        - 旧 fact: intolerance 含"A醇"，新 claim: "建立了A醇耐受"
+          → 不是矛盾，是更新
+        """
+        if existing_fact.fact_type == "constraint":
+            key = existing_fact.key
+            value = existing_fact.value
+
+            if key in ("allergies", "intolerances", "contraindicated_products"):
+                new_entities = SkincareAdapter()._extract_skincare_entities(
+                    f"{new_claim.subject_entity} {new_claim.predicate} {new_claim.outcome}"
+                )
+                for val in (value if isinstance(value, list) else [value]):
+                    if any(val.lower() in e for e in new_entities):
+                        # 判断是否"建立了耐受"类声明
+                        tolerance_keywords = ["建立了耐受", "现在能用了", "脱敏了", "耐受了"]
+                        if any(kw in new_claim.outcome for kw in tolerance_keywords):
+                            return {
+                                "conflict": False,
+                                "action": "update",
+                                "detail": f"用户声明对 {val} 已建立耐受，建议降低 constraint confidence",
+                            }
+                        return {
+                            "conflict": True,
+                            "action": "warn",
+                            "detail": (
+                                f"检测到矛盾：L3 记录「{existing_fact.sentence}」，"
+                                f"但用户正在使用含 {val} 的产品。请主动提醒。"
+                            ),
+                        }
+
+        return None
+
+
+# ── 护肤注入格式特化 ──────────────────────────────────────
+
+class SkincareInjectionFormatter:
+    """
+    护肤领域的注入格式渲染。
+    通用引擎的 render_for_injection 提供 [当前对话]/[背景]/[注意] 三块，
+    护肤在此之上添加领域特化的格式化。
+    """
+
+    @staticmethod
+    def format_skin_profile(facts: list[L3_Fact]) -> str:
+        """
+        将 L3 facts 格式化为「用户档案卡片」，注入 LLM context。
+
+        输出示例：
+        ┌─ 用户档案 ──────────────────┐
+        │ 肤质：油性 · 敏感           │
+        │ 顾虑：痘痘 · 泛红 · 痘印   │
+        │ 当前routine：AM: ... PM: ... │
+        │ 过敏：水杨酸                │
+        │ 偏好：无香精 · 轻透质地    │
+        └──────────────────────────────┘
+        """
+        profile_lines = []
+
+        identity_facts = [f for f in facts if f.content.fact_type == "identity"]
+        preference_facts = [f for f in facts if f.content.fact_type == "preference"]
+        constraint_facts = [f for f in facts if f.content.fact_type == "constraint"]
+
+        if identity_facts:
+            profile_lines.append(f"肤质档案：{' · '.join(f.content.sentence for f in identity_facts)}")
+
+        if constraint_facts:
+            profile_lines.append(f"⚠ 禁忌：{' · '.join(f.content.sentence for f in constraint_facts)}")
+
+        if preference_facts:
+            profile_lines.append(f"偏好：{' · '.join(f.content.sentence for f in preference_facts)}")
+
+        return "\n".join(profile_lines) if profile_lines else ""
+
+
+# ============================================================
+# 护肤使用示例（完整流程）
+# ============================================================
+
+# 注册
+# ForgettingEngine.register_domain("skincare", SkincareAdapter)
+# engine = ForgettingEngine()
+# agent = engine.create_agent("sk_001", "skincare")
+#
+# # 场景 1：用户咨询肤质
+# engine.ingest(agent, L0_RawMessage(
+#     role="user",
+#     text="我T区油、两颊干，鼻子毛孔大，偶尔长痘，算混合皮吗？",
+#     time=TimePosition(), wall_clock=now(), session_id="s1",
+# ))
+# # L0 → 入库，1m
+#
+# engine.ingest(agent, L0_RawMessage(
+#     role="agent",
+#     text="T区油+两颊干是典型的混合性肤质。毛孔和偶尔长痘也符合混油特征。",
+#     time=TimePosition(), wall_clock=now(), session_id="s1",
+# ))
+# # 2m → 容量未满，不下沉
+#
+# # 场景 2：产品反馈
+# engine.ingest(agent, L0_RawMessage(
+#     role="user",
+#     text="上周买了理肤泉B5修复霜，每天晚上薄涂，泛红好了很多！",
+#     time=TimePosition(), wall_clock=now(), session_id="s2",
+# ))
+# # L0→L1 压缩为：
+# #   L1_Episode(
+# #     topic="理肤泉B5使用反馈",
+# #     action_type="report_result_positive",
+# #     subject_entity="理肤泉B5修复霜",
+# #     predicate="每晚薄涂使用",
+# #     outcome="泛红明显改善",
+# #     emotional_tone=0.7,
+# #   )
+# # → 命中「护肤·有效产品确认」→ retained
+#
+# # 场景 3：关键约束（显式记忆指令）
+# engine.ingest_significant(agent, L0_RawMessage(
+#     role="user",
+#     text="对了记住，我对烟酰胺完全不耐受，一用就泛红刺痛。",
+#     time=TimePosition(), wall_clock=now(), session_id="s3",
+# ), significance=1.0)
+# # → 命中「显式记忆指令」+「护肤·约束声明」
+# # → L0→L1→L2 (ingredient_reaction)→L3 constraint
+# # → L3_Fact(key="intolerances", value=["烟酰胺"], fact_type="constraint",
+# #             sentence="用户对烟酰胺不耐受，使用后泛红刺痛")
+# # → immunity = 1e（永不过期）
+#
+# # 场景 4：检索 + 注入
+# traces = engine.retrieve(agent, RetrievalContext(
+#     current_session_id="s4",
+#     recent_messages=["想买个提亮肤色的精华，有什么推荐？"],
+#     cues=[
+#         Cue(type="action", value="提亮", weight=0.8),
+#         Cue(type="entity", value="精华", weight=0.6),
+#     ],
+#     domain_hints={"exclude_ingredients": ["烟酰胺"]},  # domain hint 由上层业务逻辑填充
+# ))
+#
+# prompt = engine.render_for_injection(agent, traces, ctx)
+# # 注入格式：
+# # ┌────────────────────────────────────┐
+# # │ [当前对话]                          │
+# # │ [user] 想买个提亮肤色的精华...      │
+# # │                                    │
+# # │ [背景]                             │
+# # │ [L3 -2c] 肤质：混合性，T区油两颊干  │
+# # │ [L3 -2c] ⚠ 禁忌：烟酰胺不耐受      │
+# # │ [L1 -1c] B5修复霜：泛红改善 [积极] │
+# # │                                    │
+# # │ [注意]                             │
+# # │ 检测到矛盾——L3 记录「用户对烟酰胺   │
+# # │ 不耐受」，常见提亮精华多含烟酰胺，   │
+# # │ 请避开含烟酰胺的产品。              │
+# # └────────────────────────────────────┘
