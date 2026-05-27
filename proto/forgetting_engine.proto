@@ -24,6 +24,12 @@ service ForgettingEngine {
 
     // ── 计费查询 ──
     rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
+
+    // ── 自助注册 ──
+    rpc RegisterTenant(RegisterRequest) returns (RegisterResponse);
+
+    // ── 我的 Agent ──
+    rpc ListMyAgents(ListMyAgentsRequest) returns (ListMyAgentsResponse);
 }
 
 
@@ -141,4 +147,24 @@ message GetUsageResponse {
     int64 calls_limit = 5;          // 当月调用上限
     string current_period = 6;      // 计费周期，如 "2026-05"
     string tier = 7;                // "free" | "pro" | "enterprise"
+}
+
+
+// ── 自助注册 ──────────────────────────────────────────
+
+message RegisterRequest {
+    string name = 1;              // 租户名称（可选）
+}
+
+message RegisterResponse {
+    string api_key = 1;           // 新生成的 x-api-key
+}
+
+
+// ── 我的 Agent ────────────────────────────────────────
+
+message ListMyAgentsRequest {}
+
+message ListMyAgentsResponse {
+    repeated string agent_ids = 1;
 }

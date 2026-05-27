@@ -74,6 +74,16 @@ class ForgettingEngineStub(object):
                 request_serializer=forgetting__engine__pb2.GetUsageRequest.SerializeToString,
                 response_deserializer=forgetting__engine__pb2.GetUsageResponse.FromString,
                 _registered_method=True)
+        self.RegisterTenant = channel.unary_unary(
+                '/forgetting_engine.ForgettingEngine/RegisterTenant',
+                request_serializer=forgetting__engine__pb2.RegisterRequest.SerializeToString,
+                response_deserializer=forgetting__engine__pb2.RegisterResponse.FromString,
+                _registered_method=True)
+        self.ListMyAgents = channel.unary_unary(
+                '/forgetting_engine.ForgettingEngine/ListMyAgents',
+                request_serializer=forgetting__engine__pb2.ListMyAgentsRequest.SerializeToString,
+                response_deserializer=forgetting__engine__pb2.ListMyAgentsResponse.FromString,
+                _registered_method=True)
 
 
 class ForgettingEngineServicer(object):
@@ -131,6 +141,20 @@ class ForgettingEngineServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RegisterTenant(self, request, context):
+        """── 自助注册 ──
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListMyAgents(self, request, context):
+        """── 我的 Agent ──
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ForgettingEngineServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -168,6 +192,16 @@ def add_ForgettingEngineServicer_to_server(servicer, server):
                     servicer.GetUsage,
                     request_deserializer=forgetting__engine__pb2.GetUsageRequest.FromString,
                     response_serializer=forgetting__engine__pb2.GetUsageResponse.SerializeToString,
+            ),
+            'RegisterTenant': grpc.unary_unary_rpc_method_handler(
+                    servicer.RegisterTenant,
+                    request_deserializer=forgetting__engine__pb2.RegisterRequest.FromString,
+                    response_serializer=forgetting__engine__pb2.RegisterResponse.SerializeToString,
+            ),
+            'ListMyAgents': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListMyAgents,
+                    request_deserializer=forgetting__engine__pb2.ListMyAgentsRequest.FromString,
+                    response_serializer=forgetting__engine__pb2.ListMyAgentsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -364,6 +398,60 @@ class ForgettingEngine(object):
             '/forgetting_engine.ForgettingEngine/GetUsage',
             forgetting__engine__pb2.GetUsageRequest.SerializeToString,
             forgetting__engine__pb2.GetUsageResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RegisterTenant(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/forgetting_engine.ForgettingEngine/RegisterTenant',
+            forgetting__engine__pb2.RegisterRequest.SerializeToString,
+            forgetting__engine__pb2.RegisterResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListMyAgents(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/forgetting_engine.ForgettingEngine/ListMyAgents',
+            forgetting__engine__pb2.ListMyAgentsRequest.SerializeToString,
+            forgetting__engine__pb2.ListMyAgentsResponse.FromString,
             options,
             channel_credentials,
             insecure,

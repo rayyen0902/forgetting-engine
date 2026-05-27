@@ -61,8 +61,9 @@ def _cues_from_pb(pb_cues: list[pb.Cue]) -> list[Cue]:
 class ForgettingEngineServicer(pb_grpc.ForgettingEngineServicer):
     """gRPC servicer wrapping a ForgettingEngine instance."""
 
-    def __init__(self, engine: ForgettingEngine):
+    def __init__(self, engine: ForgettingEngine, store=None):
         self.engine = engine
+        self.store = store
 
     # ── Agent management ──────────────────────────────────
 
@@ -70,6 +71,9 @@ class ForgettingEngineServicer(pb_grpc.ForgettingEngineServicer):
         logger.info("CreateAgent: agent_id=%s domain=%s", request.agent_id, request.domain)
         domain = request.domain or "default"
         aid = self.engine.create_agent(request.agent_id, domain)
+        if self.store:
+            api_key = _get_api_key(context)
+            self.store.add_agent(api_key, request.agent_id)
         return pb.CreateAgentResponse(agent_id=aid)
 
     def DeleteAgent(self, request: pb.DeleteAgentRequest, context) -> pb.DeleteAgentResponse:
@@ -89,6 +93,17 @@ class ForgettingEngineServicer(pb_grpc.ForgettingEngineServicer):
             for a in self.engine.list_agents()
         ]
         return pb.ListAgentsResponse(agents=agents)
+
+    def RegisterTenant(self, request: pb.RegisterRequest, context) -> pb.RegisterResponse:
+        name = request.name or ""
+        key = self.store.register(name)
+        logger.info("RegisterTenant: name=%s key=%s...", name, key[:12])
+        return pb.RegisterResponse(api_key=key)
+
+    def ListMyAgents(self, request: pb.ListMyAgentsRequest, context) -> pb.ListMyAgentsResponse:
+        api_key = _get_api_key(context)
+        agent_ids = self.store.list_agents(api_key)
+        return pb.ListMyAgentsResponse(agent_ids=agent_ids)
 
     # ── Ingest ──────────────────────────────────────────
 
@@ -213,7 +228,7 @@ def serve(port: int, domain: str, dev_key: str | None) -> None:
     if dev_key:
         seed_tenant(_TENANT_STORE, dev_key, name="dev", tier="free")
 
-    servicer = ForgettingEngineServicer(engine)
+    servicer = ForgettingEngineServicer(engine, store=_TENANT_STORE)
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=10),
         interceptors=[billing_interceptor],
