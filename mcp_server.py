@@ -41,7 +41,7 @@ def make_billing_decorator(store: TenantStore):
     """Factory: returns a decorator that checks + deducts quota before tool execution."""
 
     def billable(tool_name: str):
-        """Decorator: first arg must be x_api_key."""
+        """Decorator: first arg must be x_api_key. Passes it through as _key."""
         def decorator(func):
             @wraps(func)
             def wrapper(x_api_key: str, **kwargs):
@@ -49,7 +49,7 @@ def make_billing_decorator(store: TenantStore):
                     store.check_and_deduct(x_api_key, tool_name)
                 except QuotaExhaustedError as e:
                     return f"ERROR: {e.details}"
-                return func(**kwargs)
+                return func(_key=x_api_key, **kwargs)
             return wrapper
         return decorator
 
@@ -59,11 +59,31 @@ def make_billing_decorator(store: TenantStore):
 def register_tools(server: FastMCP, engine: ForgettingEngine, store: TenantStore) -> None:
     bill = make_billing_decorator(store)
 
-    @server.tool(description="Create a new agent memory space. Call once per user. First arg: x_api_key.")
+    # ── 自助注册（无需鉴权/计费）──
+
+    @server.tool(description="Register a new account. Give your name, get an API key back. Call once, no auth needed.")
+    def register(name: str = "") -> str:
+        key = store.register(name)
+        return f"注册成功！你的 x-api-key 是：{key}（请保存好，后续所有调用都需要它）"
+
+    # ── 我的 Agent 列表 ──
+
+    @server.tool(description="List all my agents. First arg: x_api_key.")
+    @bill("ListAgents")
+    def list_my_agents(_key: str = "") -> str:
+        agents = store.list_agents(_key)
+        if not agents:
+            return "还没有创建任何 agent。用 create_agent 创建一个。"
+        return "你的 agent 列表：\n" + "\n".join(f"- {a}" for a in agents)
+
+    # ── 创建 Agent ──
+
+    @server.tool(description="Create a new agent memory space. First arg: x_api_key.")
     @bill("CreateAgent")
-    def create_agent(agent_id: str) -> str:
-        engine.create_agent(agent_id, "default")
-        return f"agent {agent_id} created"
+    def create_agent(name: str, _key: str = "") -> str:
+        engine.create_agent(name, "default")
+        store.add_agent(_key, name)
+        return f"agent「{name}」创建成功"
 
     @server.tool(description="Ingest a message into agent memory. First arg: x_api_key.")
     @bill("Ingest")

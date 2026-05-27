@@ -154,6 +154,37 @@ class TenantStore:
             "tier": tenant.get("tier", "free"),
         }
 
+    def register(self, name: str = "") -> str:
+        """Generate a new API key, create tenant, return the key."""
+        import secrets
+        api_key = "fe-" + secrets.token_hex(12)
+        self.ensure_tenant(api_key, name, "free")
+        return api_key
+
+    def list_agents(self, api_key: str) -> list[str]:
+        """Return agent IDs owned by this tenant."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """SELECT agent_id FROM agents WHERE api_key = %s ORDER BY created_at""",
+                (api_key,),
+            )
+            return [r[0] for r in cur.fetchall()]
+
+    def add_agent(self, api_key: str, agent_id: str) -> None:
+        """Record a new agent under this tenant."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS agents (
+                       agent_id TEXT PRIMARY KEY,
+                       api_key TEXT NOT NULL REFERENCES tenants(api_key),
+                       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                   )"""
+            )
+            cur.execute(
+                "INSERT INTO agents (agent_id, api_key) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (agent_id, api_key),
+            )
+
     def _read_tenant(self, api_key: str) -> dict:
         with self.conn.cursor() as cur:
             cur.execute(
