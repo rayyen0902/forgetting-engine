@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from forgetting_engine.snapshot import TraceSnapshot, snapshots_to_csv
 from forgetting_engine.time_position import TimePosition
 
 
@@ -26,6 +27,14 @@ class EngineLogger:
     def __init__(self, capacity: int = 10000):
         self.buffer: list[EngineLog] = []
         self.capacity = capacity
+        self.snapshots: list[TraceSnapshot] = []
+        self._snapshot_round: dict[str, int] = {}  # agent_id → current round number
+
+    def snapshot_round_next(self, agent_id: str) -> int:
+        """Get next round number for an agent (auto-increment)."""
+        r = self._snapshot_round.get(agent_id, 0)
+        self._snapshot_round[agent_id] = r + 1
+        return r
 
     def append(self, entry: EngineLog) -> None:
         self.buffer.append(entry)
@@ -41,6 +50,11 @@ class EngineLogger:
 
     def by_operation(self, op: str, n: int = 20) -> list[EngineLog]:
         return [e for e in self.buffer if e.operation == op][-n:]
+
+    def to_csv(self, path: str) -> int:
+        """Export all snapshots to CSV. Returns number of rows written."""
+        snapshots_to_csv(self.snapshots, path)
+        return len(self.snapshots)
 
     def __len__(self) -> int:
         return len(self.buffer)

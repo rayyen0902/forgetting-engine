@@ -26,7 +26,6 @@ from forgetting_engine import (
     RetrievalContext,
     TimePosition,
 )
-from forgetting_engine.adapters.skincare import SkincareAdapter
 from forgetting_engine.utils import now
 
 from proto import forgetting_engine_pb2 as pb
@@ -205,10 +204,6 @@ def serve(port: int, domain: str, dev_key: str | None) -> None:
 
     engine = ForgettingEngine(llm_provider=llm, embedding_provider=embedding)
 
-    if domain == "skincare":
-        ForgettingEngine.register_domain("skincare", SkincareAdapter)
-        logger.info("Domain registered: skincare")
-
     # Init billing store — PG if DATABASE_URL set, else SQLite
     if os.getenv("DATABASE_URL"):
         from billing_postgres import PostgresTenantStore
@@ -257,7 +252,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Forgetting Engine gRPC Server")
     parser.add_argument("--port", type=int, default=50051, help="gRPC listen port")
-    parser.add_argument("--domain", type=str, default="default", help="Domain to register (e.g., skincare)")
+    parser.add_argument("--domain", type=str, default="default", help="Domain adapter (default)")
     parser.add_argument("--dev-key", type=str, default=None, help="Dev tenant API key to auto-create")
     args = parser.parse_args()
 

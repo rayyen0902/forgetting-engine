@@ -10,6 +10,7 @@ from forgetting_engine.domain_adapter import DefaultAdapter, DomainAdapter
 from forgetting_engine.embedding import EmbeddingProvider, StubEmbeddingProvider
 from forgetting_engine.llm import LLMProvider, StubLLMProvider
 from forgetting_engine.logger import EngineLog, EngineLogger
+from forgetting_engine.snapshot import TraceSnapshot
 from forgetting_engine.models import (
     Cue,
     DecayCurve,
@@ -397,6 +398,24 @@ class ForgettingEngine:
                                 "deleted",
                             )
                             report.deleted += 1
+
+            # ── Snapshot all active traces after this decay round ──
+            round_num = self.logger.snapshot_round_next(aid)
+            for t in rt.traces.values():
+                if t.is_deleted() and t.layer != Layer.L4:
+                    continue  # Already soft-deleted, skip
+                self.logger.snapshots.append(TraceSnapshot(
+                    round=round_num,
+                    agent_id=aid,
+                    trace_id=t.id,
+                    layer=t.layer.value,
+                    retention=t.retention(current),
+                    significance=t.significance,
+                    born_at_m=t.born_at.to_m(),
+                    m_since_born=current.to_m() - t.born_at.to_m(),
+                    deleted=t.is_deleted(),
+                    retained_by=",".join(t.retained_by) if t.retained_by else "",
+                ))
 
             reports[aid] = report
 
