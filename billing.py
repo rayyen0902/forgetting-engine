@@ -171,8 +171,8 @@ class QuotaExhaustedError(Exception):
 class BillingInterceptor(grpc.ServerInterceptor):
     """Intercept unary RPCs, validate api_key, enforce quota."""
 
-    def __init__(self, tenant_store: TenantStore):
-        self.store = tenant_store
+    def __init__(self, tenant_store):
+        self.store = tenant_store  # TenantStore | PostgresTenantStore（duck typing）
 
     def intercept_service(self, continuation, handler_call_details):
         method = handler_call_details.method

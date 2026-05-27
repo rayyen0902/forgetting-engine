@@ -209,8 +209,14 @@ def serve(port: int, domain: str, dev_key: str | None) -> None:
         ForgettingEngine.register_domain("skincare", SkincareAdapter)
         logger.info("Domain registered: skincare")
 
-    # Init billing store
-    _TENANT_STORE = TenantStore()
+    # Init billing store — PG if DATABASE_URL set, else SQLite
+    if os.getenv("DATABASE_URL"):
+        from billing_postgres import PostgresTenantStore
+        _TENANT_STORE = PostgresTenantStore()
+        logger.info("Billing: PostgreSQL")
+    else:
+        _TENANT_STORE = TenantStore()
+        logger.info("Billing: SQLite")
     billing_interceptor = BillingInterceptor(_TENANT_STORE)
 
     # Seed dev tenant
