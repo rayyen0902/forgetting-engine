@@ -1,7 +1,7 @@
-"""MCP server wrapping the ForgettingEngine.
+"""MCP server wrapping the ForgettingEngine + billing.
 
 Any MCP client (Claude Desktop, Cursor, etc.) can use this to access
-agent long-term memory through the standard MCP protocol.
+agent long-term memory. Each call requires x_api_key for auth + billing.
 
 Usage:
     python mcp_server.py --transport stdio     # for Claude Desktop etc.
@@ -12,11 +12,13 @@ import argparse
 import logging
 import os
 import sys
+from functools import wraps
 
 from mcp.server.fastmcp import FastMCP
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from billing import BILLABLE_METHODS, QuotaExhaustedError, TenantStore
 from forgetting_engine import Cue, ForgettingEngine, L0_RawMessage, RetrievalContext, TimePosition
 from forgetting_engine.embedding import QwenEmbeddingProvider, StubEmbeddingProvider
 from forgetting_engine.llm import QwenLLMProvider, StubLLMProvider
@@ -35,32 +37,48 @@ def build_engine() -> ForgettingEngine:
     return ForgettingEngine(llm_provider=llm, embedding_provider=embed)
 
 
-def register_tools(server: FastMCP, engine: ForgettingEngine) -> None:
+def make_billing_decorator(store: TenantStore):
+    """Factory: returns a decorator that checks + deducts quota before tool execution."""
 
-    @server.tool(description="Create a new agent memory space. Call once per user.")
+    def billable(tool_name: str):
+        """Decorator: first arg must be x_api_key."""
+        def decorator(func):
+            @wraps(func)
+            def wrapper(x_api_key: str, **kwargs):
+                try:
+                    store.check_and_deduct(x_api_key, tool_name)
+                except QuotaExhaustedError as e:
+                    return f"ERROR: {e.details}"
+                return func(**kwargs)
+            return wrapper
+        return decorator
+
+    return billable
+
+
+def register_tools(server: FastMCP, engine: ForgettingEngine, store: TenantStore) -> None:
+    bill = make_billing_decorator(store)
+
+    @server.tool(description="Create a new agent memory space. Call once per user. First arg: x_api_key.")
+    @bill("CreateAgent")
     def create_agent(agent_id: str) -> str:
-        """Create an agent with the default domain."""
         engine.create_agent(agent_id, "default")
         return f"agent {agent_id} created"
 
-    @server.tool(description="Ingest a message into agent memory. Call for every user message and agent reply.")
+    @server.tool(description="Ingest a message into agent memory. First arg: x_api_key.")
+    @bill("Ingest")
     def ingest(agent_id: str, role: str, text: str, session_id: str) -> str:
-        """Write a message to agent memory. role = 'user' or 'agent'."""
         msg = L0_RawMessage(role=role, text=text, time=TimePosition(), wall_clock=now(), session_id=session_id)
-        tid = engine.ingest(agent_id, msg)
-        return tid
+        return engine.ingest(agent_id, msg)
 
-    @server.tool(description="Retrieve agent memories and return injection text. Call before sending to LLM.")
+    @server.tool(description="Retrieve agent memories and return injection text. First arg: x_api_key.")
+    @bill("RetrieveAndRender")
     def retrieve_and_render(
         agent_id: str,
         session_id: str,
         recent_messages: list[str],
         cues: list[dict],
     ) -> str:
-        """Return formatted memory text to inject into the LLM prompt.
-
-        cues: list of {"type": "entity"|"topic"|"action", "value": "...", "weight": 0.0-1.0}
-        """
         ctx = RetrievalContext(
             current_session_id=session_id,
             recent_messages=recent_messages,
@@ -80,13 +98,12 @@ def main():
     args = parser.parse_args()
 
     engine = build_engine()
+    store = TenantStore("data/tenants.db")
     server = FastMCP("forgetting-engine")
-    register_tools(server, engine)
+    register_tools(server, engine, store)
 
-    if args.transport == "sse":
-        server.run(transport="sse")
-    else:
-        server.run(transport="stdio")
+    logger.info("Billing: MCP tools — Ingest, RetrieveAndRender billable; CreateAgent checked")
+    server.run(transport=args.transport)
 
 
 if __name__ == "__main__":
