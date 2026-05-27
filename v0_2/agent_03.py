@@ -20,8 +20,8 @@ ENGINE_ADDR = os.getenv("FE_ADDR", "knownot.cc:50051")
 QWEN_KEY = os.getenv("QWEN_API_KEY")
 
 # TLS 连接
-creds = grpc.ssl_channel_credentials()
-channel = grpc.secure_channel(ENGINE_ADDR, creds)
+
+channel = grpc.insecure_channel(ENGINE_ADDR)
 stub = pb_grpc.ForgettingEngineStub(channel)
 md = [("x-api-key", API_KEY)]
 
