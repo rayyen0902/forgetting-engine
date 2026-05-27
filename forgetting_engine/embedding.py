@@ -62,3 +62,54 @@ def get_embedding() -> EmbeddingProvider:
 def set_embedding(provider: EmbeddingProvider) -> None:
     global _default_provider
     _default_provider = provider
+
+
+# ── Qwen (DashScope) embedding provider ──────────────────────
+
+
+class QwenEmbeddingProvider(EmbeddingProvider):
+    """Qwen text-embedding via DashScope compatible API.
+
+    Environment variables:
+        QWEN_API_KEY  (required)
+        QWEN_MODEL    (default: text-embedding-v3)
+        QWEN_API_URL  (default: https://dashscope.aliyuncs.com/compatible-mode/v1)
+    """
+
+    def __init__(self):
+        import os
+
+        self.api_key = os.getenv("QWEN_API_KEY")
+        if not self.api_key:
+            raise ValueError("QWEN_API_KEY environment variable is required")
+
+        self.model = os.getenv("QWEN_EMBED_MODEL", "text-embedding-v3")
+        self.api_url = os.getenv(
+            "QWEN_API_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+
+    def embed(self, text: str) -> list[float]:
+        import requests
+
+        if not text:
+            return []
+
+        resp = requests.post(
+            f"{self.api_url}/embeddings",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "input": text,
+                "encoding_format": "float",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        return body["data"][0]["embedding"]
+
+    def similarity(self, a: list[float], b: list[float]) -> float:
+        return cosine_sim(a, b)

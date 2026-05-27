@@ -194,11 +194,16 @@ def serve(port: int, domain: str, dev_key: str | None) -> None:
     import os
 
     from forgetting_engine.llm import QwenLLMProvider, StubLLMProvider
+    from forgetting_engine.embedding import QwenEmbeddingProvider, StubEmbeddingProvider
 
     llm = QwenLLMProvider() if os.getenv("QWEN_API_KEY") else StubLLMProvider()
-    logger.info("LLM: %s", "Qwen" if isinstance(llm, QwenLLMProvider) else "Stub")
+    embedding = QwenEmbeddingProvider() if os.getenv("QWEN_API_KEY") else StubEmbeddingProvider()
+    logger.info("LLM: %s  Embed: %s",
+        "Qwen" if isinstance(llm, QwenLLMProvider) else "Stub",
+        "Qwen" if isinstance(embedding, QwenEmbeddingProvider) else "Stub",
+    )
 
-    engine = ForgettingEngine(llm_provider=llm)
+    engine = ForgettingEngine(llm_provider=llm, embedding_provider=embedding)
 
     if domain == "skincare":
         ForgettingEngine.register_domain("skincare", SkincareAdapter)
@@ -220,9 +225,22 @@ def serve(port: int, domain: str, dev_key: str | None) -> None:
     pb_grpc.add_ForgettingEngineServicer_to_server(servicer, server)
 
     addr = f"[::]:{port}"
-    server.add_insecure_port(addr)
+
+    tls_cert = os.getenv("GRPC_TLS_CERT")
+    tls_key = os.getenv("GRPC_TLS_KEY")
+    if tls_cert and tls_key:
+        with open(tls_cert, "rb") as f:
+            cert_pem = f.read()
+        with open(tls_key, "rb") as f:
+            key_pem = f.read()
+        creds = grpc.ssl_server_credentials([(key_pem, cert_pem)])
+        server.add_secure_port(addr, creds)
+        logger.info("gRPC server (TLS) listening on %s", addr)
+    else:
+        server.add_insecure_port(addr)
+        logger.info("gRPC server (insecure) listening on %s", addr)
+
     server.start()
-    logger.info("gRPC server listening on %s", addr)
     logger.info("Billing: free tier (1K agents, 100K calls/month)")
 
     server.wait_for_termination()
