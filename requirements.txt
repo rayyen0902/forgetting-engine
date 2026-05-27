@@ -1,2 +1,5 @@
 numpy>=1.26
+grpcio>=1.60
+grpcio-tools>=1.60
+requests>=2.31
 pytest>=8.0

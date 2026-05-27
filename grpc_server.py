@@ -191,7 +191,14 @@ _TENANT_STORE: TenantStore | None = None
 def serve(port: int, domain: str, dev_key: str | None) -> None:
     global _TENANT_STORE
 
-    engine = ForgettingEngine()
+    import os
+
+    from forgetting_engine.llm import QwenLLMProvider, StubLLMProvider
+
+    llm = QwenLLMProvider() if os.getenv("QWEN_API_KEY") else StubLLMProvider()
+    logger.info("LLM: %s", "Qwen" if isinstance(llm, QwenLLMProvider) else "Stub")
+
+    engine = ForgettingEngine(llm_provider=llm)
 
     if domain == "skincare":
         ForgettingEngine.register_domain("skincare", SkincareAdapter)
