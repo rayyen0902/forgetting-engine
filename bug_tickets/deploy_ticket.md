@@ -40,20 +40,13 @@ pip install -r requirements.txt
 # 3. 编译 proto
 python compile_proto.py
 
-# 4. 创建 HuFu 生产租户（替换 API key）
-python -c "
-from billing import TenantStore, seed_dev_tenant
-store = TenantStore('data/tenants.db')
-seed_dev_tenant(store, 'hf-prod-REPLACE-ME', 'HuFu-Production', 'pro')
-"
-
-# 5. 启动
+# 4. 启动
 nohup python grpc_server.py \
   --port 50051 \
   --domain skincare \
   > /var/log/forgetting-engine.log 2>&1 &
 
-# 6. 验证
+# 5. 验证（首次调用自动创建租户，无需手动建）
 python -c "
 import grpc
 from proto import forgetting_engine_pb2 as pb, forgetting_engine_pb2_grpc as pb_grpc
