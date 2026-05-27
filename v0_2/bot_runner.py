@@ -33,7 +33,10 @@ CUE = cfg["cue"]
 ch = grpc.insecure_channel(ENGINE)
 stub = pb_grpc.ForgettingEngineStub(ch)
 md = [("x-api-key", API_KEY)]
-stub.CreateAgent(pb.CreateAgentRequest(agent_id=AGENT_ID, domain="default"), metadata=md)
+try:
+    stub.CreateAgent(pb.CreateAgentRequest(agent_id=AGENT_ID, domain="default"), metadata=md)
+except Exception:
+    pass  # agent 已存在，跳过
 
 session = f"{BOT_ID}-chat"
 
@@ -47,7 +50,7 @@ def llm(prompt: str, system: str | None = None) -> str:
         "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
         headers={"Authorization": f"Bearer {QWEN_KEY}", "Content-Type": "application/json"},
         json={"model": "deepseek-v4-flash", "messages": msgs, "max_tokens": 256},
-        timeout=30,
+        timeout=60,
     )
     return r.json()["choices"][0]["message"]["content"]
 

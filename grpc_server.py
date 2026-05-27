@@ -18,7 +18,7 @@ from concurrent import futures
 
 import grpc
 
-from billing import BillingInterceptor, TenantStore, seed_dev_tenant
+from billing import TenantStore, make_billing_interceptor, seed_tenant
 from forgetting_engine import (
     Cue,
     ForgettingEngine,
@@ -204,19 +204,14 @@ def serve(port: int, domain: str, dev_key: str | None) -> None:
 
     engine = ForgettingEngine(llm_provider=llm, embedding_provider=embedding)
 
-    # Init billing store — PG if DATABASE_URL set, else SQLite
-    if os.getenv("DATABASE_URL"):
-        from billing_postgres import PostgresTenantStore
-        _TENANT_STORE = PostgresTenantStore()
-        logger.info("Billing: PostgreSQL")
-    else:
-        _TENANT_STORE = TenantStore()
-        logger.info("Billing: SQLite")
-    billing_interceptor = BillingInterceptor(_TENANT_STORE)
+    # Init billing store (PostgreSQL only)
+    _TENANT_STORE = TenantStore()
+    billing_interceptor = make_billing_interceptor(_TENANT_STORE)
+    logger.info("Billing: PostgreSQL")
 
     # Seed dev tenant
     if dev_key:
-        seed_dev_tenant(_TENANT_STORE, dev_key, name="dev", tier="free")
+        seed_tenant(_TENANT_STORE, dev_key, name="dev", tier="free")
 
     servicer = ForgettingEngineServicer(engine)
     server = grpc.server(

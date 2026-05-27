@@ -4,3 +4,4 @@ grpcio-tools>=1.60
 requests>=2.31
 pytest>=8.0
 mcp>=1.27
+psycopg2-binary>=2.9

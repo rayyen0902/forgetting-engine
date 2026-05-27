@@ -18,7 +18,7 @@ from mcp.server.fastmcp import FastMCP
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from billing import BILLABLE_METHODS, QuotaExhaustedError, TenantStore
+from billing import QuotaExhaustedError, TenantStore
 from forgetting_engine import Cue, ForgettingEngine, L0_RawMessage, RetrievalContext, TimePosition
 from forgetting_engine.embedding import QwenEmbeddingProvider, StubEmbeddingProvider
 from forgetting_engine.llm import QwenLLMProvider, StubLLMProvider
